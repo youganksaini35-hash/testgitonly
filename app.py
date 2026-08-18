@@ -47,6 +47,7 @@ CONFIG_FILE = os.path.join(WORKSPACE_DIR, "bot_config.json")
 child_process = None
 child_process_name = None
 child_process_start_time = None
+is_intentionally_stopped = False
 child_logs = []
 LOG_BUFFER_MAX = 200
 
@@ -277,13 +278,19 @@ def install_script_requirements(py_filename):
 def child_watchdog(proc, fname):
     """Watches the running child process and sends alert if it exits or crashes."""
     ret = proc.wait()
-    global child_process, child_process_name, child_process_start_time
+    global child_process, child_process_name, child_process_start_time, is_intentionally_stopped
     
     # Only act if this is still the registered active process
     if child_process == proc:
         child_process = None
         child_process_name = None
         child_process_start_time = None
+        
+        # If stopped intentionally by admin or terminated via SIGKILL/SIGTERM, skip crash alert
+        if is_intentionally_stopped or ret in [-9, -15, 137, 143]:
+            logger.info(f"Process {fname} stopped cleanly by admin (Exit code: {ret}).")
+            is_intentionally_stopped = False
+            return
         
         recent_err = "\n".join(child_logs[-20:]) if child_logs else "(No output recorded)"
         escaped_err = html.escape(recent_err)
@@ -298,7 +305,7 @@ def child_watchdog(proc, fname):
                         f"🔴 <b>Exit Code:</b> <code>{ret}</code>\n\n"
                         f"<b>Error Traceback:</b>\n"
                         f"<pre>{escaped_err[-2000:]}</pre>\n\n"
-                        f"💡 <i>Neeche button dabakar <b>{missing_mod}</b> ko auto-install karke restart karein:</i>"
+                        f"💡 <i>Click below to auto-install <b>{missing_mod}</b> and restart:</i>"
                     )
                     markup = {
                         "inline_keyboard": [
@@ -313,7 +320,7 @@ def child_watchdog(proc, fname):
                         f"🔴 <b>Exit Code:</b> <code>{ret}</code>\n\n"
                         f"<b>Error Traceback:</b>\n"
                         f"<pre>{escaped_err[-2500:]}</pre>\n\n"
-                        f"💡 <i>Tip: Missing package hone par <b>Install Pip</b> use karein.</i>"
+                        f"💡 <i>Tip: Use <b>Install Pip Package</b> if a dependency is missing.</i>"
                     )
                     markup = {
                         "inline_keyboard": [
@@ -351,7 +358,8 @@ def check_and_install_reqs(req_path):
         logger.error(f"Error checking requirements hash: {e}")
 
 def start_child_app(filename="bot.py"):
-    global child_process, child_process_name, child_process_start_time, child_logs
+    global child_process, child_process_name, child_process_start_time, child_logs, is_intentionally_stopped
+    is_intentionally_stopped = False
     
     # Strip any prefix like scripts/
     base_filename = os.path.basename(filename)
@@ -362,7 +370,7 @@ def start_child_app(filename="bot.py"):
         if os.path.exists(os.path.join(WORKSPACE_DIR, filename)):
             full_path = os.path.join(WORKSPACE_DIR, filename)
         else:
-            return False, f"File <code>{base_filename}</code> scripts folder me nahi mili."
+            return False, f"File <code>{base_filename}</code> not found in scripts folder."
     
     # Smart Auto-install: only if not already installed in current session
     req_path = get_script_req_path(base_filename)
@@ -418,13 +426,13 @@ def start_child_app(filename="bot.py"):
                 return False, (
                     f"❌ <b>{base_filename} Crash: Missing Package <code>{missing_mod}</code></b>\n\n"
                     f"<b>Error Details:</b>\n<pre>{html.escape(err_msg[-1500:])}</pre>\n\n"
-                    f"💡 <i>Aap <b>Install Pip</b> se <code>{missing_mod}</code> install karein.</i>"
+                    f"💡 <i>Use <b>Install Pip</b> to install <code>{missing_mod}</code>.</i>"
                 )
             
             return False, (
-                f"❌ <b>{base_filename} fail ho gaya (Exit Code: {poll_res})</b>\n\n"
+                f"❌ <b>{base_filename} failed to start (Exit Code: {poll_res})</b>\n\n"
                 f"<b>Error Details:</b>\n<pre>{html.escape(err_msg[-2500:])}</pre>\n\n"
-                f"💡 <i>Tip: Missing package hone par <b>Install Pip Package</b> use karein.</i>"
+                f"💡 <i>Tip: Use <b>Install Pip Package</b> if a dependency is missing.</i>"
             )
         
         req_note = f" (📦 {os.path.basename(req_path)})" if req_path else " (📄 Standalone)"
@@ -433,7 +441,8 @@ def start_child_app(filename="bot.py"):
         return False, f"❌ Start error: {e}"
 
 def stop_child_app():
-    global child_process, child_process_name, child_process_start_time
+    global child_process, child_process_name, child_process_start_time, is_intentionally_stopped
+    is_intentionally_stopped = True
     config["auto_run_file"] = None
     save_config(config)
     
@@ -444,39 +453,37 @@ def stop_child_app():
         pid = child_process.pid
         try:
             parent = psutil.Process(pid)
-            for child in parent.children(recursive=True):
+            children = parent.children(recursive=True)
+            for child in children:
                 try:
                     child.kill()
                 except Exception:
                     pass
             parent.kill()
-            child_process.wait(timeout=2)
             stopped_any = True
-        except Exception as e:
-            logger.error(f"Error killing process: {e}")
+        except Exception:
             try:
                 child_process.kill()
                 stopped_any = True
             except Exception:
                 pass
-    
-    child_process = None
-    child_process_name = None
-    child_process_start_time = None
-    
-    # Also kill any stray python bot.py processes running in workspace
+        child_process = None
+        child_process_name = None
+        child_process_start_time = None
+
+    # Force kill any stray processes
     for p in psutil.process_iter(['pid', 'name', 'cmdline']):
         try:
             cmd = " ".join(p.info.get('cmdline') or [])
-            if "bot.py" in cmd and p.info['pid'] != os.getpid():
+            if "scripts/" in cmd and p.pid != os.getpid():
                 p.kill()
                 stopped_any = True
         except Exception:
             pass
 
     if stopped_any:
-        return True, f"🛑 <b>{name}</b> ko successfully stop aur kill kar diya gaya."
-    return False, "Abhi koi script run nahi ho rahi hai."
+        return True, f"🛑 <b>{name}</b> has been stopped successfully."
+    return False, "ℹ️ No running script found to stop."
 
 def restart_child_app():
     file_to_run = child_process_name or config.get("auto_run_file", "bot.py")
@@ -585,7 +592,7 @@ def render_dashboard_text():
         f"💾 <b>RAM Usage:</b> {ram.percent}% ({ram.used // (1024*1024)}MB / {ram.total // (1024*1024)}MB)\n"
         f"📈 <b>CPU Load:</b> {cpu}%\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "💡 <i>Aap koi bhi .py file ya requirements.txt direct chat me bhej sakte hain!</i>"
+        "💡 <i>Send any .py script or requirements.txt directly in chat to deploy!</i>"
     )
     return status_text
 
@@ -667,7 +674,7 @@ def handle_text_message(chat_id, user_id, text):
         else:
             send_tg_message(
                 chat_id,
-                "⚠️ <b>Invalid Format!</b>\n\nKripya <code>KEY=VALUE</code> format me bhejein.\n(Example: <code>BOT_TOKEN=123456:AAH...</code>)",
+                "⚠️ <b>Invalid Format!</b>\n\nPlease send in <code>KEY=VALUE</code> format.\n(Example: <code>BOT_TOKEN=123456:AAH...</code>)",
                 reply_markup={"inline_keyboard": [[{"text": "🔙 Back", "callback_data": f"env_dash_{target_py}"}]]}
             )
         return
@@ -823,15 +830,15 @@ def prompt_env_script_select(chat_id, user_id, message_id=None):
         text = (
             "⚙️ <b>Per-Script Environment (.env) Manager</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "📁 <code>scripts/</code> folder me abhi koi Python file nahi mili.\n\n"
-            "💡 <i>Aap chat me nayi script (.py) bhej sakte hain.</i>"
+            "📁 No Python scripts found in <code>scripts/</code> folder.\n\n"
+            "💡 <i>Send a new script (.py) in chat to add one.</i>"
         )
     else:
         text = (
             "⚙️ <b>Per-Script Environment (.env) Manager</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Har script ka apna private <b><code>.env</code></b> hota hai jo sirf uske run hone par inject hota hai.\n\n"
-            "<i>Neeche script select karein jiske variables view/edit karne hain:</i>"
+            "Each script has its own private <b><code>.env</code></b> file loaded on launch.\n\n"
+            "<i>Select a script below to view & manage its variables:</i>"
         )
         for py in files:
             env_vars = read_script_env(py)
@@ -852,7 +859,7 @@ def prompt_script_env_dashboard(chat_id, user_id, py_filename, message_id=None):
     
     var_lines = []
     if not env_vars:
-        var_lines.append("<i>Abhi is script ke liye koi private variable set nahi hai.</i>")
+        var_lines.append("<i>No environment variables configured yet.</i>")
     else:
         for k, v in sorted(env_vars.items()):
             masked = mask_secret_val(v)
@@ -864,7 +871,7 @@ def prompt_script_env_dashboard(chat_id, user_id, py_filename, message_id=None):
         f"📁 <b>Dedicated Config:</b> <code>scripts/{base_name}.env</code>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         + "\n".join(var_lines)
-        + "\n\n<i>Neeche button se variable add karein ya delete karein:</i>"
+        + "\n\n<i>Use the buttons below to add or remove variables:</i>"
     )
     
     buttons = [
@@ -892,10 +899,10 @@ def prompt_script_env_dashboard(chat_id, user_id, py_filename, message_id=None):
 def prompt_env_delete_list(chat_id, user_id, py_filename, message_id=None):
     env_vars = read_script_env(py_filename)
     if not env_vars:
-        text = f"ℹ️ <code>{py_filename}</code> me delete karne ke liye koi variable nahi hai."
+        text = f"ℹ️ No variables to delete for <code>{py_filename}</code>."
         markup = {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": f"env_dash_{py_filename}"}]]}
     else:
-        text = f"🗑️ <b>Delete Variable from <code>{py_filename}</code>:</b>\n\nNeeche kisi variable par tap karke use remove karein:"
+        text = f"🗑️ <b>Delete Variable from <code>{py_filename}</code>:</b>\n\nTap a variable below to remove it:"
         buttons = []
         for k in sorted(env_vars.keys()):
             buttons.append([{"text": f"❌ Delete {k}", "callback_data": f"env_dodel_{py_filename}_{k}"}])
@@ -921,8 +928,8 @@ def prompt_runner_menu(chat_id, user_id, message_id=None):
         text = (
             "🚀 <b>Scripts Runner Manager</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "📁 <code>scripts/</code> folder me abhi koi Python file nahi mili.\n\n"
-            "💡 <i>Aap chat me direct koi bhi <code>.py</code> file bhej sakte hain, wo automatically <code>scripts/</code> folder me add ho jayegi!</i>"
+            "📁 No Python scripts found in <code>scripts/</code> folder.\n\n"
+            "💡 <i>You can send any <code>.py</code> file in chat to add it!</i>"
         )
     else:
         text = (
@@ -930,7 +937,7 @@ def prompt_runner_menu(chat_id, user_id, message_id=None):
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             f"• <b>Active Process:</b> {'🟢 ' + child_process_name if is_alive else '🔴 None (Stopped)'}\n"
             f"• <b>Total Scripts Available:</b> {len(files)}\n\n"
-            "<i>Neeche kisi bhi script par click karke use run karein:</i>"
+            "<i>Tap any script below to launch it:</i>"
         )
         for py in files:
             is_this_running = is_alive and child_process_name == py
@@ -1098,7 +1105,7 @@ def show_files_view(chat_id, message_id=None):
 def prompt_stop_menu(chat_id, user_id, message_id=None):
     is_alive = child_process and child_process.poll() is None
     if not is_alive or not child_process_name:
-        text = "ℹ️ <b>No Running Scripts</b>\n\nAbhi koi bhi script active/run nahi ho rahi hai."
+        text = "ℹ️ <b>No Running Scripts</b>\n\nThere is no script currently running."
         markup = {"inline_keyboard": [[{"text": "🔙 Main Menu", "callback_data": "menu_main"}]]}
     else:
         cu_sec = int(time.time() - child_process_start_time) if child_process_start_time else 0
@@ -1111,7 +1118,7 @@ def prompt_stop_menu(chat_id, user_id, message_id=None):
             f"• <b>Active Script:</b> <code>{child_process_name}</code>\n"
             f"• <b>PID:</b> <code>{child_process.pid}</code>\n"
             f"• <b>Uptime:</b> {ch}h {cm}m {cs}s\n\n"
-            "<i>Neeche script par click karein aur stop confirm karein:</i>"
+            "<i>Confirm termination below:</i>"
         )
         markup = {
             "inline_keyboard": [
@@ -1165,11 +1172,11 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
         text = (
             f"⚙️ <b>Set Environment Variable for <code>{fname}</code></b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Abhi chat me variable ka naam aur value bhej dein:\n\n"
+            "Please send the variable name and value in chat:\n\n"
             "• <b>Format:</b> <code>KEY=VALUE</code>\n"
             "• <b>Example:</b> <code>BOT_TOKEN=123456789:AAH...</code>\n"
             "• <b>Example:</b> <code>GMAIL_EMAIL=mybot@gmail.com</code>\n\n"
-            "<i>Yeh variable dedicated <code>scripts/{fname.rsplit('.', 1)[0]}.env</code> me save hoga.</i>"
+            "<i>Saved into dedicated <code>scripts/{fname.rsplit('.', 1)[0]}.env</code>.</i>"
         )
         edit_tg_message(chat_id, message_id, text, reply_markup={"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": f"env_dash_{fname}"}]]})
 
@@ -1248,7 +1255,7 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
         text = (
             f"⚠️ <b>Confirmation Required</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Kya aap sach me <code>{fname}</code> script ko <b>STOP / TERMINATE</b> karna chahte hain?"
+            f"Are you sure you want to <b>STOP and terminate</b> <code>{fname}</code>?"
         )
         markup = {
             "inline_keyboard": [
@@ -1263,7 +1270,7 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
         fname = data.replace("do_stop_", "")
         ok, msg = stop_child_app()
         answer_callback(callback_id, f"{fname} stopped!", show_alert=True)
-        edit_tg_message(chat_id, message_id, f"🛑 <b>{fname} ko successfully stop kar diya gaya!</b>", reply_markup=get_main_menu_keyboard())
+        edit_tg_message(chat_id, message_id, f"🛑 <b>{fname} has been stopped successfully!</b>", reply_markup=get_main_menu_keyboard())
 
     # 6. Restart Script
     elif data == "menu_restart":
@@ -1302,8 +1309,7 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
         text = (
             f"⚠️ <b>Confirm File Deletion</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Kya aap sach me <code>scripts/{fname}</code> ko <b>delete</b> karna chahte hain?\n\n"
-            "<i>Yeh file scripts/ folder se permanent delete ho jayegi.</i>"
+            f"Are you sure you want to permanently delete <code>scripts/{fname}</code>?"
         )
         markup = {
             "inline_keyboard": [
@@ -1351,8 +1357,8 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
         answer_callback(callback_id)
         text = (
             "📤 <b>Upload New Python Script</b>\n\n"
-            "Abhi chat me apni <code>.py</code> file bhej dein.\n"
-            "Bot usko automatically <code>scripts/</code> folder me save karega!"
+            "Please send your <code>.py</code> file in chat.\n"
+            "It will automatically be saved into the <code>scripts/</code> folder!"
         )
         edit_tg_message(chat_id, message_id, text, reply_markup=get_back_keyboard())
 
@@ -1442,9 +1448,9 @@ def handle_document_upload(chat_id, user_id, doc):
         text = (
             f"✨ <b>Python Script Saved:</b> <code>scripts/{file_name}</code>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "📁 File <b>scripts/</b> folder me save ho chuki hai!\n\n"
-            "📦 <b>requirements.txt bhej sakte hain</b> taaki dependencies install ho sakein,\n"
-            "ya neeche button se <b>Direct Run</b> ya <b>Scripts Runner</b> open kar sakte hain:"
+            "📁 Saved into <b>scripts/</b> folder.\n\n"
+            "📦 You can send a <b>requirements.txt</b> file to install dependencies,\n"
+            "or use the buttons below to run directly:"
         )
         markup = {
             "inline_keyboard": [
