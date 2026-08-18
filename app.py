@@ -701,39 +701,33 @@ def show_logs_view(chat_id, message_id=None):
 
 def show_files_view(chat_id, message_id=None):
     os.makedirs(SCRIPTS_DIR, exist_ok=True)
-    script_files = sorted([f for f in os.listdir(SCRIPTS_DIR) if f.endswith(".py")])
-    root_files = sorted([f for f in os.listdir(WORKSPACE_DIR) if os.path.isfile(os.path.join(WORKSPACE_DIR, f)) and not f.startswith(".") and f != "__pycache__"])
+    files = sorted([f for f in os.listdir(SCRIPTS_DIR) if not f.startswith(".") and f != "__pycache__"])
     
     file_lines = []
     download_buttons = []
     
-    if script_files:
-        file_lines.append("<b>📁 scripts/ Folder (GitHub):</b>")
-        for it in script_files:
+    if not files:
+        file_lines.append("<i>Scripts folder (scripts/) is currently empty.\nSend any .py script or requirements.txt to upload!</i>")
+    else:
+        for it in files:
             p = os.path.join(SCRIPTS_DIR, it)
-            sz = os.path.getsize(p)
-            file_lines.append(f"  • 📄 <code>{it}</code> ({sz} bytes)")
-            download_buttons.append([
-                {"text": f"📥 scripts/{it}", "callback_data": f"file_dl_scripts/{it}"},
-                {"text": "🗑️ Delete", "callback_data": f"file_del_scripts/{it}"}
-            ])
-    
-    if root_files:
-        file_lines.append("\n<b>📁 Root Workspace:</b>")
-        for it in root_files:
-            p = os.path.join(WORKSPACE_DIR, it)
-            sz = os.path.getsize(p)
-            file_lines.append(f"  • 📄 <code>{it}</code> ({sz} bytes)")
-            download_buttons.append([
-                {"text": f"📥 {it}", "callback_data": f"file_dl_{it}"},
-                {"text": "🗑️ Delete", "callback_data": f"file_del_{it}"}
-            ])
+            if os.path.isfile(p):
+                sz = os.path.getsize(p)
+                file_lines.append(f"• 📄 <code>{it}</code> ({sz} bytes)")
+                download_buttons.append([
+                    {"text": f"📥 {it}", "callback_data": f"file_dl_{it}"},
+                    {"text": "🗑️ Delete", "callback_data": f"file_del_{it}"}
+                ])
     
     text = (
-        "📂 <b>Workspace Files Manager</b>\n\n"
-        + ("\n".join(file_lines) if file_lines else "<i>No files found</i>")
+        "📂 <b>Scripts File Manager</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📁 <b>Target Directory:</b> <code>scripts/</code> (GitHub Repository)\n"
+        f"📊 <b>Total Files:</b> {len(files)}\n\n"
+        + "\n".join(file_lines)
         + "\n\n<i>Tap a file below to download or delete:</i>"
     )
+    download_buttons.append([{"text": "📤 Upload New Script", "callback_data": "menu_upload_prompt"}])
     download_buttons.append([{"text": "🔙 Main Menu", "callback_data": "menu_main"}])
     markup = {"inline_keyboard": download_buttons}
     
@@ -850,7 +844,11 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
     # 9. Download File
     elif data.startswith("file_dl_"):
         fname = data.replace("file_dl_", "")
-        fpath = os.path.join(WORKSPACE_DIR, fname)
+        if os.path.exists(os.path.join(SCRIPTS_DIR, fname)):
+            fpath = os.path.join(SCRIPTS_DIR, fname)
+        else:
+            fpath = os.path.join(WORKSPACE_DIR, fname)
+
         if os.path.exists(fpath):
             answer_callback(callback_id, f"Sending {fname}...")
             send_tg_document(chat_id, fpath, caption=f"📄 <b>{fname}</b>")
@@ -864,8 +862,8 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
         text = (
             f"⚠️ <b>Confirm File Deletion</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Kya aap sach me <code>{fname}</code> ko <b>delete</b> karna chahte hain?\n\n"
-            "<i>Yeh file workspace aur GitHub repo dono se permanent remove ho jayegi.</i>"
+            f"Kya aap sach me <code>scripts/{fname}</code> ko <b>delete</b> karna chahte hain?\n\n"
+            "<i>Yeh file GitHub repo ke scripts/ folder se permanent delete ho jayegi.</i>"
         )
         markup = {
             "inline_keyboard": [
@@ -878,7 +876,6 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
     # 10b. Do Delete File Execution
     elif data.startswith("do_delete_file_"):
         fname = data.replace("do_delete_file_", "")
-        # Check in scripts/ first, then workspace
         if os.path.exists(os.path.join(SCRIPTS_DIR, fname)):
             fpath = os.path.join(SCRIPTS_DIR, fname)
         else:
@@ -886,7 +883,7 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
 
         if os.path.exists(fpath):
             os.remove(fpath)
-            git_sync_to_github(f"Deleted {fname} via Telegram")
+            git_sync_to_github(f"Deleted scripts/{fname} via Telegram")
             answer_callback(callback_id, f"{fname} deleted!", show_alert=True)
             show_files_view(chat_id, message_id)
         else:
