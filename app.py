@@ -275,6 +275,112 @@ def install_script_requirements(py_filename):
     except Exception as e:
         return False, str(e)
 
+# ---------------------------------------------------------------------------
+# Security & Resource Guard Shield (>60% CPU, Crypto-Mining, Loop Detector)
+# ---------------------------------------------------------------------------
+CRYPTO_SIGNATURES = [
+    "stratum+tcp://", "stratum+ssl://", "xmrig", "cryptonight", "minerd",
+    "ethminer", "monero", "hashrate", "coinhive", "nicehash", "stratum"
+]
+
+def scan_script_for_abuse(fpath):
+    """Scans Python script source code for crypto-mining and dangerous abuse patterns."""
+    if not os.path.exists(fpath):
+        return None
+    try:
+        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read().lower()
+        for sig in CRYPTO_SIGNATURES:
+            if sig in content:
+                return f"Crypto-Mining Signature Detected ('{sig}')"
+    except Exception:
+        pass
+    return None
+
+def trigger_guard_violation(fname, reason, peak_cpu, peak_ram_mb):
+    """Safely terminates the offending process and alerts all admins with logs and reasons."""
+    logger.error(f"🚨 [SecurityGuard] Terminating {fname} due to policy violation: {reason}")
+    
+    recent_logs = "\n".join(child_logs[-25:]) if child_logs else "(No output recorded)"
+    escaped_logs = html.escape(recent_logs)
+    
+    stop_child_app()
+    
+    alert_text = (
+        "🚨 <b>SECURITY & RESOURCE GUARD ALERT</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📁 <b>Script Name:</b> <code>{fname}</code>\n"
+        f"🛑 <b>Action:</b> <b>Process Auto-Stopped for Safety</b>\n"
+        f"⚠️ <b>Trigger Reason:</b>\n👉 <i>{reason}</i>\n\n"
+        "📊 <b>Telemetry at Stop:</b>\n"
+        f"• 📈 <b>Peak CPU:</b> <code>{peak_cpu:.1f}%</code> (Limit: 60.0%)\n"
+        f"• 💾 <b>RAM Usage:</b> <code>{peak_ram_mb} MB</code>\n\n"
+        "📋 <b>Recent Execution Logs:</b>\n"
+        f"<pre>{escaped_logs[-2000:]}</pre>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "💡 <i>Your server has been protected. Review script code before restarting.</i>"
+    )
+    markup = {
+        "inline_keyboard": [
+            [{"text": "📋 View Live Logs", "callback_data": "menu_logs"}, {"text": "🚀 Scripts Runner", "callback_data": "menu_runner"}],
+            [{"text": "🔙 Main Menu", "callback_data": "menu_main"}]
+        ]
+    }
+    notify_all_admins(alert_text, reply_markup=markup)
+
+def resource_guard_monitor(proc, fname):
+    """Monitors CPU and RAM of running child process. Auto-stops if >60% CPU sustained or abuse detected."""
+    high_cpu_count = 0
+    max_cpu_seen = 0.0
+    
+    try:
+        ps_proc = psutil.Process(proc.pid)
+    except Exception:
+        return
+
+    while proc.poll() is None:
+        try:
+            # Measure CPU load of child process (including its worker threads)
+            cpu_usage = ps_proc.cpu_percent(interval=2.0)
+            mem_info = ps_proc.memory_info()
+            ram_mb = mem_info.rss // (1024 * 1024)
+            if cpu_usage > max_cpu_seen:
+                max_cpu_seen = cpu_usage
+
+            # Check recent logs for crypto miner strings
+            recent_logs_str = " ".join(child_logs[-15:]).lower() if child_logs else ""
+            for sig in CRYPTO_SIGNATURES:
+                if sig in recent_logs_str:
+                    trigger_guard_violation(
+                        fname,
+                        reason=f"Crypto-Mining Activity Detected (Keyword: <code>{sig}</code>)",
+                        peak_cpu=cpu_usage,
+                        peak_ram_mb=ram_mb
+                    )
+                    return
+
+            # Check for sustained High CPU (>60% threshold for 3 consecutive checks ~ 6-8 seconds)
+            if cpu_usage > 60.0:
+                high_cpu_count += 1
+                logger.warning(f"⚠️ [ResourceGuard] High CPU usage detected on {fname}: {cpu_usage:.1f}% ({high_cpu_count}/3)")
+                if high_cpu_count >= 3:
+                    trigger_guard_violation(
+                        fname,
+                        reason=f"Sustained High CPU Load (>60% Threshold: {cpu_usage:.1f}%) - Runaway Loop or Resource Abuse",
+                        peak_cpu=cpu_usage,
+                        peak_ram_mb=ram_mb
+                    )
+                    return
+            else:
+                high_cpu_count = max(0, high_cpu_count - 1)
+
+            time.sleep(2)
+        except psutil.NoSuchProcess:
+            break
+        except Exception as e:
+            logger.debug(f"Resource guard loop error: {e}")
+            time.sleep(2)
+
 def child_watchdog(proc, fname):
     """Watches the running child process and sends alert if it exits or crashes."""
     ret = proc.wait()
@@ -377,6 +483,15 @@ def start_child_app(filename="bot.py"):
     if req_path:
         check_and_install_reqs(req_path)
 
+    # Security scan before launch
+    abuse_reason = scan_script_for_abuse(full_path)
+    if abuse_reason:
+        return False, (
+            f"🚫 <b>Launch Blocked by Security Guard!</b>\n\n"
+            f"⚠️ <b>Reason:</b> <i>{abuse_reason}</i>\n\n"
+            f"💡 <i>Remove suspicious mining / abuse code to run this script.</i>"
+        )
+
     if child_process and child_process.poll() is None:
         stop_child_app()
     
@@ -410,6 +525,7 @@ def start_child_app(filename="bot.py"):
         
         threading.Thread(target=log_stream_reader, args=(proc.stdout,), daemon=True).start()
         threading.Thread(target=child_watchdog, args=(proc, base_filename), daemon=True).start()
+        threading.Thread(target=resource_guard_monitor, args=(proc, base_filename), daemon=True).start()
         
         # Initial health check (wait 1.5s to verify process stays alive)
         time.sleep(1.5)
