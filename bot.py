@@ -32,9 +32,15 @@ except ImportError:
 BOT_TOKEN = os.getenv("BOT_TOKEN", "Enter_your_bot_tokken_here")
 GMAIL_EMAIL = os.getenv("GMAIL_EMAIL", "enter_your_gmail_name_@gmail.com")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "Enter_Your_gmail_password_here")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "Enter your_openrouter_api_key_here")
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "Enter_your_admin_id_here"))
-FEEDBACK_CHANNEL_ID = int(os.getenv("FEEDBACK_CHANNEL_ID", "Enter_your_channel_id"))
+def safe_int_env(key, default_val=0):
+    val = os.getenv(key, str(default_val))
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default_val
+
+ADMIN_USER_ID = safe_int_env("ADMIN_USER_ID", 7249511572)
+FEEDBACK_CHANNEL_ID = safe_int_env("FEEDBACK_CHANNEL_ID", 0)
 
 # Database setup - Use absolute path for Plesk
 DB_NAME = os.getenv("DB_PATH", os.path.join(os.getcwd(), "bot.db"))
