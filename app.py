@@ -572,6 +572,16 @@ def start_child_app(filename="bot.py"):
         script_private_env = read_script_env(clean_name)
         env.update(script_private_env)
         
+        # Ensure a physical .env file exists in the script's cwd so python-dotenv / dotenv.load_dotenv() works!
+        if script_private_env:
+            target_dot_env = os.path.join(script_working_dir, ".env")
+            try:
+                with open(target_dot_env, "w", encoding="utf-8") as f:
+                    for k, v in sorted(script_private_env.items()):
+                        f.write(f"{k}={v}\n")
+            except Exception as e:
+                logger.error(f"Error creating local .env: {e}")
+        
         cmd = [sys.executable, "-u", full_path]
         proc = subprocess.Popen(
             cmd,
@@ -956,55 +966,94 @@ def handle_text_message(chat_id, user_id, text):
         send_tg_message(chat_id, render_dashboard_text(), reply_markup=get_main_menu_keyboard())
 
 # ---------------------------------------------------------------------------
-# Per-Script Environment Variables (.env) Engine
+# Per-Script Environment Variables (.env) Engine & Entry Point Filter
 # ---------------------------------------------------------------------------
-def get_script_env_path(py_filename):
+NON_RUNNABLE_MODULES = {
+    "database.py", "db.py", "models.py", "model.py", "utils.py", "util.py",
+    "config.py", "configs.py", "helpers.py", "helper.py", "__init__.py",
+    "settings.py", "constants.py", "constant.py", "schema.py", "schemas.py",
+    "types.py", "handlers.py", "filters.py", "client.py", "session.py"
+}
+
+def is_runnable_entry_point(fpath):
+    base = os.path.basename(fpath).lower()
+    if not base.endswith(".py"):
+        return False
+    if base.startswith("_") or base in NON_RUNNABLE_MODULES:
+        return False
+    return True
+
+def get_all_env_candidates(py_filename):
     clean = py_filename.replace("scripts/", "").lstrip("/")
     base_name = os.path.basename(clean)
     if base_name.endswith(".py"):
         base_name = base_name[:-3]
-    
-    # Check directory of script if nested
     dir_name = os.path.dirname(clean)
-    if dir_name:
-        nested_env = os.path.join(SCRIPTS_DIR, dir_name, f"{base_name}.env")
-        if os.path.exists(nested_env):
-            return nested_env
-        nested_dot_env = os.path.join(SCRIPTS_DIR, dir_name, ".env")
-        if os.path.exists(nested_dot_env):
-            return nested_dot_env
-        return nested_env
     
-    return os.path.join(SCRIPTS_DIR, f"{base_name}.env")
+    candidates = []
+    # 1. Project subfolder .env if nested (Higher Priority)
+    if dir_name:
+        candidates.append(os.path.join(SCRIPTS_DIR, dir_name, f"{base_name}.env"))
+        candidates.append(os.path.join(SCRIPTS_DIR, dir_name, ".env"))
+    
+    # 2. Root scripts .env & dedicated env
+    candidates.append(os.path.join(SCRIPTS_DIR, f"{base_name}.env"))
+    candidates.append(os.path.join(SCRIPTS_DIR, ".env"))
+    return candidates
+
+def get_script_env_path(py_filename):
+    candidates = get_all_env_candidates(py_filename)
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return candidates[0] if candidates else os.path.join(SCRIPTS_DIR, ".env")
 
 def read_script_env(py_filename):
-    env_path = get_script_env_path(py_filename)
-    env_dict = {}
-    if os.path.exists(env_path):
-        try:
-            with open(env_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    if "=" in line:
-                        k, v = line.split("=", 1)
-                        k = k.strip()
-                        v = v.strip().strip("'\"")
-                        env_dict[k] = v
-        except Exception as e:
-            logger.error(f"Error reading env for {py_filename}: {e}")
-    return env_dict
+    """Reads and merges all relevant .env files for this script."""
+    merged_env = {}
+    candidates = get_all_env_candidates(py_filename)
+    
+    # Read from root to specific so specific overrides generic
+    for c in reversed(candidates):
+        if os.path.exists(c):
+            try:
+                with open(c, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if "=" in line:
+                            k, v = line.split("=", 1)
+                            k = k.strip()
+                            v = v.strip().strip("'\"")
+                            if k:
+                                merged_env[k] = v
+            except Exception as e:
+                logger.error(f"Error reading env from {c}: {e}")
+    return merged_env
 
 def write_script_env(py_filename, env_dict):
-    env_path = get_script_env_path(py_filename)
-    os.makedirs(SCRIPTS_DIR, exist_ok=True)
+    """Writes environment variables to dedicated script env AND .env in working dir."""
+    clean = py_filename.replace("scripts/", "").lstrip("/")
+    base_name = os.path.basename(clean)
+    if base_name.endswith(".py"):
+        base_name = base_name[:-3]
+    dir_name = os.path.dirname(clean)
+    
+    target_dir = os.path.join(SCRIPTS_DIR, dir_name) if dir_name else SCRIPTS_DIR
+    os.makedirs(target_dir, exist_ok=True)
+    
+    primary_env = os.path.join(target_dir, f"{base_name}.env")
+    dot_env = os.path.join(target_dir, ".env")
+    
     try:
-        with open(env_path, "w", encoding="utf-8") as f:
-            for k, v in sorted(env_dict.items()):
-                f.write(f"{k}={v}\n")
-        base_name = os.path.basename(py_filename)
-        git_sync_to_github(f"Update private env for {base_name}")
+        content = "\n".join([f"{k}={v}" for k, v in sorted(env_dict.items())]) + "\n"
+        with open(primary_env, "w", encoding="utf-8") as f:
+            f.write(content)
+        with open(dot_env, "w", encoding="utf-8") as f:
+            f.write(content)
+            
+        git_sync_to_github(f"Update environment variables for {base_name}")
         return True, "Env saved successfully."
     except Exception as e:
         return False, f"Error saving env: {e}"
@@ -1116,22 +1165,27 @@ def prompt_runner_menu(chat_id, user_id, message_id=None):
     os.makedirs(SCRIPTS_DIR, exist_ok=True)
     
     # Scan all Python files recursively
-    files = []
+    all_files = []
     for root, _, fs in os.walk(SCRIPTS_DIR):
         for f in fs:
             if f.endswith(".py") and not f.startswith("."):
                 rel = os.path.relpath(os.path.join(root, f), SCRIPTS_DIR)
-                files.append(rel)
-    files.sort()
+                all_files.append(rel)
+    all_files.sort()
+    
+    # Filter for runnable entry points (so database.py, models.py etc. don't get Run buttons)
+    runnable_files = [f for f in all_files if is_runnable_entry_point(f)]
+    if not runnable_files and all_files:
+        runnable_files = all_files # Fallback if only 1 non-standard file exists
     
     is_alive = child_process and child_process.poll() is None
     
     buttons = []
-    if not files:
+    if not runnable_files:
         text = (
             "🚀 <b>Scripts Runner Manager</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "📁 No Python scripts found in <code>scripts/</code> folder.\n\n"
+            "📁 No runnable Python scripts found in <code>scripts/</code> folder.\n\n"
             "💡 <i>You can send any <code>.py</code> or <code>.zip</code> file in chat to add it!</i>"
         )
     else:
@@ -1139,10 +1193,10 @@ def prompt_runner_menu(chat_id, user_id, message_id=None):
             "🚀 <b>Scripts Runner Manager</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             f"• <b>Active Process:</b> {'🟢 ' + child_process_name if is_alive else '🔴 None (Stopped)'}\n"
-            f"• <b>Total Scripts Available:</b> {len(files)}\n\n"
+            f"• <b>Total Runnable Scripts:</b> {len(runnable_files)}\n\n"
             "<i>Tap any script below to launch it:</i>"
         )
-        for py in files:
+        for py in runnable_files:
             is_this_running = is_alive and child_process_name == py
             btn_prefix = "🟢 [RUNNING] " if is_this_running else "▶️ Run "
             
@@ -1240,14 +1294,20 @@ def show_logs_view(chat_id, message_id=None):
 
 def show_files_view(chat_id, message_id=None):
     os.makedirs(SCRIPTS_DIR, exist_ok=True)
-    files = sorted([f for f in os.listdir(SCRIPTS_DIR) if not f.startswith(".") and f != "__pycache__"])
+    files = []
+    for root, _, fs in os.walk(SCRIPTS_DIR):
+        for f in fs:
+            if not f.startswith(".") and f != "__pycache__":
+                rel = os.path.relpath(os.path.join(root, f), SCRIPTS_DIR)
+                files.append(rel)
+    files.sort()
     is_alive = child_process and child_process.poll() is None
     
     file_lines = []
     download_buttons = []
     
     if not files:
-        file_lines.append("<i>Scripts folder (scripts/) is currently empty.\nSend any .py script or requirements.txt to upload!</i>")
+        file_lines.append("<i>Scripts folder (scripts/) is currently empty.\nSend any .py script, .env, or .zip archive to upload!</i>")
     else:
         for it in files:
             p = os.path.join(SCRIPTS_DIR, it)
@@ -1257,6 +1317,7 @@ def show_files_view(chat_id, message_id=None):
                 status_icon = "🟢" if is_this_running else "📄"
                 
                 if it.endswith(".py"):
+                    is_runnable = is_runnable_entry_point(it)
                     req_p = get_script_req_path(it)
                     has_env = len(read_script_env(it)) > 0
                     badges = []
@@ -1265,21 +1326,18 @@ def show_files_view(chat_id, message_id=None):
                     else:
                         badges.append("📄 Standalone")
                     if has_env:
-                        badges.append(f"🔒 {it.rsplit('.', 1)[0]}.env")
+                        badges.append(f"🔒 {os.path.basename(it).rsplit('.', 1)[0]}.env")
                     
                     badge_str = f" <i>({' | '.join(badges)})</i>"
                     file_lines.append(f"• {status_icon} <code>{it}</code> ({sz} bytes){badge_str}{' <b>[RUNNING]</b>' if is_this_running else ''}")
                     
+                    row_btns = [{"text": f"📥 {it}", "callback_data": f"file_dl_{it}"}]
                     if is_this_running:
-                        run_btn = {"text": "🛑 Stop", "callback_data": "menu_stop"}
-                    else:
-                        run_btn = {"text": "▶️ Run", "callback_data": f"exec_run_{it}"}
-                    
-                    download_buttons.append([
-                        {"text": f"📥 {it}", "callback_data": f"file_dl_{it}"},
-                        run_btn,
-                        {"text": "🗑️ Delete", "callback_data": f"file_del_{it}"}
-                    ])
+                        row_btns.append({"text": "🛑 Stop", "callback_data": "menu_stop"})
+                    elif is_runnable:
+                        row_btns.append({"text": "▶️ Run", "callback_data": f"exec_run_{it}"})
+                    row_btns.append({"text": "🗑️ Delete", "callback_data": f"file_del_{it}"})
+                    download_buttons.append(row_btns)
                 else:
                     file_lines.append(f"• 📄 <code>{it}</code> ({sz} bytes)")
                     download_buttons.append([
@@ -1292,13 +1350,14 @@ def show_files_view(chat_id, message_id=None):
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📁 <b>Directory:</b> <code>scripts/</code> (Cloud Storage)\n"
         f"📊 <b>Total Files:</b> {len(files)}\n\n"
-        + "\n".join(file_lines)
+        + "\n".join(file_lines[:40])
+        + ("\n<i>...and more files</i>" if len(file_lines) > 40 else "")
         + "\n\n<i>Tap a button below to Download, Run, or Delete:</i>"
     )
     download_buttons.append([{"text": "🚀 Scripts Runner", "callback_data": "menu_runner"}])
-    download_buttons.append([{"text": "📤 Upload New Script", "callback_data": "menu_upload_prompt"}])
+    download_buttons.append([{"text": "📤 Upload New Script / ZIP", "callback_data": "menu_upload_prompt"}])
     download_buttons.append([{"text": "🔙 Main Menu", "callback_data": "menu_main"}])
-    markup = {"inline_keyboard": download_buttons}
+    markup = {"inline_keyboard": download_buttons[:90]} # Keep under TG inline keyboard limit
     
     if message_id:
         edit_tg_message(chat_id, message_id, text, reply_markup=markup)
