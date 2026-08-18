@@ -257,13 +257,16 @@ def child_watchdog(proc, fname):
 def start_child_app(filename="bot.py"):
     global child_process, child_process_name, child_process_start_time, child_logs
     
-    # Check in scripts/ directory first, then root workspace
-    if os.path.exists(os.path.join(SCRIPTS_DIR, filename)):
-        full_path = os.path.join(SCRIPTS_DIR, filename)
-    elif os.path.exists(os.path.join(WORKSPACE_DIR, filename)):
-        full_path = os.path.join(WORKSPACE_DIR, filename)
-    else:
-        return False, f"File <code>{filename}</code> scripts folder me nahi mili."
+    # Strip any prefix like scripts/
+    base_filename = os.path.basename(filename)
+    full_path = os.path.join(SCRIPTS_DIR, base_filename)
+    
+    if not os.path.exists(full_path):
+        # Fallback to workspace root if not in scripts
+        if os.path.exists(os.path.join(WORKSPACE_DIR, filename)):
+            full_path = os.path.join(WORKSPACE_DIR, filename)
+        else:
+            return False, f"File <code>{base_filename}</code> scripts folder me nahi mili."
     
     if child_process and child_process.poll() is None:
         stop_child_app()
@@ -272,6 +275,8 @@ def start_child_app(filename="bot.py"):
         child_logs = []
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        # Ensure python path includes scripts folder so all local modules import smoothly
+        env["PYTHONPATH"] = f"{SCRIPTS_DIR}:{WORKSPACE_DIR}:{env.get('PYTHONPATH', '')}"
         env.update(config.get("env_vars", {}))
         
         cmd = [sys.executable, "-u", full_path]
@@ -282,15 +287,15 @@ def start_child_app(filename="bot.py"):
             stdin=subprocess.DEVNULL,
             text=True,
             bufsize=1,
-            cwd=WORKSPACE_DIR,
+            cwd=SCRIPTS_DIR, # All generated files (.db, .log, etc) will be saved in scripts/!
             env=env
         )
         child_process = proc
-        child_process_name = filename
+        child_process_name = base_filename
         child_process_start_time = time.time()
         
         threading.Thread(target=log_stream_reader, args=(proc.stdout,), daemon=True).start()
-        threading.Thread(target=child_watchdog, args=(proc, filename), daemon=True).start()
+        threading.Thread(target=child_watchdog, args=(proc, base_filename), daemon=True).start()
         
         # Initial health check (wait 1.5s to verify process stays alive)
         time.sleep(1.5)
@@ -302,12 +307,12 @@ def start_child_app(filename="bot.py"):
             child_process_name = None
             child_process_start_time = None
             return False, (
-                f"❌ <b>{filename} fail ho gaya (Exit Code: {poll_res})</b>\n\n"
+                f"❌ <b>{base_filename} fail ho gaya (Exit Code: {poll_res})</b>\n\n"
                 f"<b>Error Details:</b>\n<pre>{err_msg[-2500:]}</pre>\n\n"
                 f"💡 <i>Tip: Missing package hone par <b>Install Pip Package</b> use karein.</i>"
             )
         
-        return True, f"✨ <b>{filename}</b> started successfully!\n🆔 Process ID: <code>{proc.pid}</code>\n🟢 State: Active (Running)"
+        return True, f"✨ <b>{base_filename}</b> started successfully!\n🆔 Process ID: <code>{proc.pid}</code>\n🟢 State: Active (Running)"
     except Exception as e:
         return False, f"❌ Start error: {e}"
 

@@ -28,10 +28,12 @@ except ImportError:
     PIL_AVAILABLE = False
     logging.warning("PIL not available, some features may be limited")
 
-# Configuration - Use environment variables for Plesk
-BOT_TOKEN = os.getenv("BOT_TOKEN", "Enter_your_bot_tokken_here")
-GMAIL_EMAIL = os.getenv("GMAIL_EMAIL", "enter_your_gmail_name_@gmail.com")
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "Enter_Your_gmail_password_here")
+# Configuration - Use environment variables
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+GMAIL_EMAIL = os.getenv("GMAIL_EMAIL", "")
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+
 def safe_int_env(key, default_val=0):
     val = os.getenv(key, str(default_val))
     try:
@@ -2151,6 +2153,12 @@ Type /cancel to exit feedback mode.
                 await asyncio.sleep(5)
     
     async def run(self):
+        if not BOT_TOKEN or "Enter" in BOT_TOKEN:
+            msg = "❌ ERROR: BOT_TOKEN is not configured! Please configure BOT_TOKEN to run bot.py."
+            logger.error(msg)
+            print(msg)
+            return
+
         self.application = Application.builder().token(BOT_TOKEN).build()
         
         # Set the bot application in notification queue
