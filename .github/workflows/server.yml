@@ -1,0 +1,56 @@
+name: Relay Server Daemon
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Fallback cron trigger (every 30 minutes to restart if all runners terminate)
+    - cron: '*/30 * * * *'
+
+jobs:
+  relay_runner:
+    name: Execute Relay Server
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Cloudflared (Optional)
+        run: |
+          if [ -n "${{ secrets.TUNNEL_TOKEN }}" ]; then
+            echo "Installing cloudflared..."
+            curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+            sudo dpkg -i cloudflared.deb
+            rm -f cloudflared.deb
+          else
+            echo "TUNNEL_TOKEN secret is not set. Skipping cloudflared install."
+          fi
+
+      - name: Run Relay Server App
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          WORKFLOW_FILE: "server.yml"
+          WORKFLOW_REF: "main"
+          # Run duration: 330 minutes (5.5 hours) before graceful handoff
+          RUN_DURATION_SECONDS: "19800"
+          LOCK_TTL_SECONDS: "180"
+          HEARTBEAT_INTERVAL: "30"
+          CHECKPOINT_INTERVAL: "60"
+        run: |
+          python app.py
