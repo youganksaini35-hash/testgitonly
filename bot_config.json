@@ -1,4 +1,7 @@
 {
-  "admin_id": 7249511572,
+  "admin_ids": [
+    7249511572,
+    7251749429
+  ],
   "auto_run_file": "bot.py"
 }

