@@ -24,7 +24,7 @@ logger = logging.getLogger("TGBotController")
 # ---------------------------------------------------------------------------
 # Configuration & Environment Variables
 # ---------------------------------------------------------------------------
-TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "8947225372:AAH7ubfHB-KyelruqrjoIgrgCeAZj_XDWYE")
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 GH_PAT = os.environ.get("GH_PAT", os.environ.get("GITHUB_TOKEN", ""))
 REPO = os.environ.get("GITHUB_REPOSITORY", "Saini920/testgitonly")
 RUN_ID = os.environ.get("GITHUB_RUN_ID", "local-dev")
