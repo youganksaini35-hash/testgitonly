@@ -308,18 +308,48 @@ def start_child_app(filename="bot.py"):
 
 def stop_child_app():
     global child_process, child_process_name, child_process_start_time
+    config["auto_run_file"] = None
+    save_config(config)
+    
+    stopped_any = False
+    name = child_process_name or "bot.py"
+    
     if child_process and child_process.poll() is None:
-        name = child_process_name
+        pid = child_process.pid
         try:
-            child_process.terminate()
-            child_process.wait(timeout=4)
-        except subprocess.TimeoutExpired:
-            child_process.kill()
-        
-        child_process = None
-        child_process_name = None
-        child_process_start_time = None
-        return True, f"🛑 <b>{name}</b> ko stop kar diya gaya."
+            parent = psutil.Process(pid)
+            for child in parent.children(recursive=True):
+                try:
+                    child.kill()
+                except Exception:
+                    pass
+            parent.kill()
+            child_process.wait(timeout=2)
+            stopped_any = True
+        except Exception as e:
+            logger.error(f"Error killing process: {e}")
+            try:
+                child_process.kill()
+                stopped_any = True
+            except Exception:
+                pass
+    
+    child_process = None
+    child_process_name = None
+    child_process_start_time = None
+    
+    # Also kill any stray python bot.py processes running in workspace
+    for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+        try:
+            cmd = " ".join(p.info.get('cmdline') or [])
+            if "bot.py" in cmd and p.info['pid'] != os.getpid():
+                p.kill()
+                stopped_any = True
+        except Exception:
+            pass
+
+    if stopped_any:
+        return True, f"🛑 <b>{name}</b> ko successfully stop aur kill kar diya gaya."
     return False, "Abhi koi script run nahi ho rahi hai."
 
 def restart_child_app():
