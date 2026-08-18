@@ -1,0 +1,7 @@
+2026-08-18 11:37:04,969 - __main__ - INFO - Connected to database at /home/runner/work/testgitonly/testgitonly/bot.db
+2026-08-18 11:37:04,975 - __main__ - INFO - Added 'active' column to aliases table
+2026-08-18 11:37:04,979 - __main__ - INFO - Added 'feedback_photo_id' column to feedback table
+2026-08-18 11:37:05,063 - __main__ - INFO - Starting bot...
+2026-08-18 11:37:05,169 - __main__ - ERROR - Gmail connection failed: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+2026-08-18 11:37:05,169 - __main__ - ERROR - Failed to reconnect to Gmail. Retrying in 30 seconds.
+2026-08-18 11:37:05,519 - httpx - INFO - HTTP Request: POST https://api.telegram.org/botEnter_your_bot_tokken_here/getMe "HTTP/1.1 404 Not Found"
