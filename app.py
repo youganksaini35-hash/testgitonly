@@ -230,6 +230,47 @@ def log_stream_reader(pipe):
     except Exception:
         pass
 
+def extract_missing_module(log_text):
+    import re
+    match = re.search(r"No module named ['\"]([^'\"]+)['\"]", log_text)
+    if match:
+        return match.group(1)
+    return None
+
+def get_script_req_path(py_filename):
+    base_name = os.path.basename(py_filename)
+    if base_name.endswith(".py"):
+        base_name = base_name[:-3]
+    
+    candidates = [
+        os.path.join(SCRIPTS_DIR, f"{base_name}.requirements.txt"),
+        os.path.join(SCRIPTS_DIR, f"{base_name}_requirements.txt"),
+        os.path.join(SCRIPTS_DIR, f"{base_name}_req.txt"),
+        os.path.join(SCRIPTS_DIR, f"{base_name}.req.txt")
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return None
+
+def install_script_requirements(py_filename):
+    req_path = get_script_req_path(py_filename)
+    if not req_path:
+        return True, "No dedicated requirements file."
+    
+    try:
+        res = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-r", req_path],
+            capture_output=True,
+            text=True
+        )
+        if res.returncode == 0:
+            return True, res.stdout[-2000:]
+        else:
+            return False, (res.stdout + "\n" + res.stderr)[-2000:]
+    except Exception as e:
+        return False, str(e)
+
 def child_watchdog(proc, fname):
     """Watches the running child process and sends alert if it exits or crashes."""
     ret = proc.wait()
@@ -241,29 +282,47 @@ def child_watchdog(proc, fname):
         child_process_name = None
         child_process_start_time = None
         
-        recent_err = "\n".join(child_logs[-15:]) if child_logs else "(No output recorded)"
+        recent_err = "\n".join(child_logs[-20:]) if child_logs else "(No output recorded)"
+        escaped_err = html.escape(recent_err)
         
         if config.get("admin_ids"):
             if ret != 0:
-                alert_text = (
-                    f"⚠️ <b>Script Crashed / Exited!</b>\n"
-                    f"📁 <b>File:</b> <code>{fname}</code>\n"
-                    f"🔴 <b>Exit Code:</b> <code>{ret}</code>\n\n"
-                    f"<b>Error Traceback:</b>\n"
-                    f"<pre>{recent_err[-3000:]}</pre>\n\n"
-                    f"💡 <i>Tip: Agar koi module missing hai toh package install karein.</i>"
-                )
-                markup = {
-                    "inline_keyboard": [
-                        [{"text": "📦 Install Missing Package", "callback_data": "menu_pip_prompt"}],
-                        [{"text": "🔄 Try Restarting", "callback_data": f"exec_run_{fname}"}],
-                        [{"text": "🔙 Main Menu", "callback_data": "menu_main"}]
-                    ]
-                }
+                missing_mod = extract_missing_module(recent_err)
+                if missing_mod:
+                    alert_text = (
+                        f"⚠️ <b>Script Crashed: Missing Module <code>{missing_mod}</code></b>\n"
+                        f"📁 <b>Script:</b> <code>{fname}</code>\n"
+                        f"🔴 <b>Exit Code:</b> <code>{ret}</code>\n\n"
+                        f"<b>Error Traceback:</b>\n"
+                        f"<pre>{escaped_err[-2000:]}</pre>\n\n"
+                        f"💡 <i>Neeche button dabakar <b>{missing_mod}</b> ko auto-install karke restart karein:</i>"
+                    )
+                    markup = {
+                        "inline_keyboard": [
+                            [{"text": f"📦 Auto-Install {missing_mod} & Run", "callback_data": f"autofix_pkg_{missing_mod}_{fname}"}],
+                            [{"text": "📋 Live Logs", "callback_data": "menu_logs"}, {"text": "🔙 Main Menu", "callback_data": "menu_main"}]
+                        ]
+                    }
+                else:
+                    alert_text = (
+                        f"⚠️ <b>Script Crashed / Exited!</b>\n"
+                        f"📁 <b>File:</b> <code>{fname}</code>\n"
+                        f"🔴 <b>Exit Code:</b> <code>{ret}</code>\n\n"
+                        f"<b>Error Traceback:</b>\n"
+                        f"<pre>{escaped_err[-2500:]}</pre>\n\n"
+                        f"💡 <i>Tip: Missing package hone par <b>Install Pip</b> use karein.</i>"
+                    )
+                    markup = {
+                        "inline_keyboard": [
+                            [{"text": "📦 Install Pip Package", "callback_data": "menu_pip_prompt"}],
+                            [{"text": "🔄 Try Restarting", "callback_data": f"exec_run_{fname}"}],
+                            [{"text": "🔙 Main Menu", "callback_data": "menu_main"}]
+                        ]
+                    }
             else:
                 alert_text = (
                     f"ℹ️ <b>Script Completed:</b> <code>{fname}</code> exited normally (Code 0).\n\n"
-                    f"<b>Output:</b>\n<pre>{recent_err[-2000:]}</pre>"
+                    f"<b>Output:</b>\n<pre>{escaped_err[-2000:]}</pre>"
                 )
                 markup = get_main_menu_keyboard()
             notify_all_admins(alert_text, reply_markup=markup)
@@ -282,6 +341,12 @@ def start_child_app(filename="bot.py"):
         else:
             return False, f"File <code>{base_filename}</code> scripts folder me nahi mili."
     
+    # Auto-install dedicated requirements if present
+    req_path = get_script_req_path(base_filename)
+    if req_path:
+        logger.info(f"Auto-installing requirements for {base_filename} from {os.path.basename(req_path)}...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "-r", req_path], capture_output=True, text=True)
+
     if child_process and child_process.poll() is None:
         stop_child_app()
     
@@ -289,6 +354,8 @@ def start_child_app(filename="bot.py"):
         child_logs = []
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONPATH"] = f"{SCRIPTS_DIR}:{WORKSPACE_DIR}:{env.get('PYTHONPATH', '')}"
+        
         # Inject global env vars
         env.update(config.get("env_vars", {}))
         
@@ -320,16 +387,26 @@ def start_child_app(filename="bot.py"):
         poll_res = proc.poll()
         if poll_res is not None:
             err_msg = "\n".join(child_logs) if child_logs else "(No output recorded)"
+            missing_mod = extract_missing_module(err_msg)
             child_process = None
             child_process_name = None
             child_process_start_time = None
+            
+            if missing_mod:
+                return False, (
+                    f"❌ <b>{base_filename} Crash: Missing Package <code>{missing_mod}</code></b>\n\n"
+                    f"<b>Error Details:</b>\n<pre>{html.escape(err_msg[-1500:])}</pre>\n\n"
+                    f"💡 <i>Aap <b>Install Pip</b> se <code>{missing_mod}</code> install karein.</i>"
+                )
+            
             return False, (
                 f"❌ <b>{base_filename} fail ho gaya (Exit Code: {poll_res})</b>\n\n"
-                f"<b>Error Details:</b>\n<pre>{err_msg[-2500:]}</pre>\n\n"
+                f"<b>Error Details:</b>\n<pre>{html.escape(err_msg[-2500:])}</pre>\n\n"
                 f"💡 <i>Tip: Missing package hone par <b>Install Pip Package</b> use karein.</i>"
             )
         
-        return True, f"✨ <b>{base_filename}</b> started successfully!\n🆔 Process ID: <code>{proc.pid}</code>\n🟢 State: Active (Running)"
+        req_note = f" (📦 {os.path.basename(req_path)})" if req_path else " (📄 Standalone)"
+        return True, f"✨ <b>{base_filename}</b> started successfully!{req_note}\n🆔 Process ID: <code>{proc.pid}</code>\n🟢 State: Active (Running)"
     except Exception as e:
         return False, f"❌ Start error: {e}"
 
@@ -835,7 +912,20 @@ def prompt_runner_menu(chat_id, user_id, message_id=None):
         for py in files:
             is_this_running = is_alive and child_process_name == py
             btn_prefix = "🟢 [RUNNING] " if is_this_running else "▶️ Run "
-            buttons.append([{"text": f"{btn_prefix}{py}", "callback_data": f"exec_run_{py}"}])
+            
+            req_p = get_script_req_path(py)
+            has_env = len(read_script_env(py)) > 0
+            
+            badges = []
+            if req_p:
+                badges.append("📦 Batch Reqs")
+            else:
+                badges.append("📄 Standalone")
+            if has_env:
+                badges.append("🔒 .env")
+                
+            badge_str = f" [{', '.join(badges)}]"
+            buttons.append([{"text": f"{btn_prefix}{py}{badge_str}", "callback_data": f"exec_run_{py}"}])
 
     buttons.append([{"text": "📤 Upload New Script", "callback_data": "menu_upload_prompt"}])
     if is_alive:
@@ -932,9 +1022,21 @@ def show_files_view(chat_id, message_id=None):
                 sz = os.path.getsize(p)
                 is_this_running = is_alive and child_process_name == it
                 status_icon = "🟢" if is_this_running else "📄"
-                file_lines.append(f"• {status_icon} <code>{it}</code> ({sz} bytes){' <b>[RUNNING]</b>' if is_this_running else ''}")
                 
                 if it.endswith(".py"):
+                    req_p = get_script_req_path(it)
+                    has_env = len(read_script_env(it)) > 0
+                    badges = []
+                    if req_p:
+                        badges.append(f"📦 {os.path.basename(req_p)}")
+                    else:
+                        badges.append("📄 Standalone")
+                    if has_env:
+                        badges.append(f"🔒 {it.rsplit('.', 1)[0]}.env")
+                    
+                    badge_str = f" <i>({' | '.join(badges)})</i>"
+                    file_lines.append(f"• {status_icon} <code>{it}</code> ({sz} bytes){badge_str}{' <b>[RUNNING]</b>' if is_this_running else ''}")
+                    
                     if is_this_running:
                         run_btn = {"text": "🛑 Stop", "callback_data": "menu_stop"}
                     else:
@@ -946,6 +1048,7 @@ def show_files_view(chat_id, message_id=None):
                         {"text": "🗑️ Delete", "callback_data": f"file_del_{it}"}
                     ])
                 else:
+                    file_lines.append(f"• 📄 <code>{it}</code> ({sz} bytes)")
                     download_buttons.append([
                         {"text": f"📥 {it}", "callback_data": f"file_dl_{it}"},
                         {"text": "🗑️ Delete", "callback_data": f"file_del_{it}"}
@@ -1078,6 +1181,30 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
     elif data in ["menu_runner", "menu_run_select"]:
         answer_callback(callback_id)
         prompt_runner_menu(chat_id, user_id, message_id)
+
+    # Autofix Missing Package Callback
+    elif data.startswith("autofix_pkg_"):
+        parts = data.replace("autofix_pkg_", "").split("_", 1)
+        if len(parts) == 2:
+            pkg_name, target_py = parts[0], parts[1]
+            answer_callback(callback_id, f"Installing {pkg_name}...")
+            send_tg_message(chat_id, f"⏳ <b>Auto-Installing:</b> <code>{pkg_name}</code> for <code>{target_py}</code>...")
+            
+            res = subprocess.run([sys.executable, "-m", "pip", "install", pkg_name], capture_output=True, text=True)
+            
+            # Save into target_py's dedicated requirements file
+            base_n = target_py.rsplit('.', 1)[0]
+            req_file = os.path.join(SCRIPTS_DIR, f"{base_n}.requirements.txt")
+            with open(req_file, "a+", encoding="utf-8") as f:
+                f.seek(0)
+                existing = f.read()
+                if pkg_name not in existing:
+                    f.write(f"\n{pkg_name}\n")
+            git_sync_to_github(f"Add {pkg_name} to {base_n}.requirements.txt")
+            
+            send_tg_message(chat_id, f"✅ <b>{pkg_name} installed & saved to {base_n}.requirements.txt!</b>\n🚀 Now auto-launching <code>{target_py}</code>...")
+            res_ok, res_msg = start_child_app(target_py)
+            send_tg_message(chat_id, res_msg, reply_markup=get_main_menu_keyboard())
 
     # 4. Execute a specific file
     elif data.startswith("exec_run_"):
@@ -1243,22 +1370,44 @@ def handle_document_upload(chat_id, user_id, doc):
     
     current_state = user_states.get(user_id)
     
-    # 1. If uploaded requirements.txt
-    if file_name == "requirements.txt":
-        send_tg_message(chat_id, "📦 <b>scripts/requirements.txt received!</b>\n⏳ Installing dependencies in real-time...")
+    # 1. If uploaded requirements file
+    if file_name.endswith(".requirements.txt") or file_name.endswith("_requirements.txt") or file_name.endswith("_req.txt") or file_name == "requirements.txt":
+        # Extract target script name if named like bot.requirements.txt
+        if file_name == "requirements.txt":
+            target_py = "bot.py"
+        elif file_name.endswith(".requirements.txt"):
+            target_py = file_name[:-17] + ".py"
+        elif file_name.endswith("_requirements.txt"):
+            target_py = file_name[:-17] + ".py"
+        else:
+            target_py = file_name.split("_")[0].split(".")[0] + ".py"
+            
+        send_tg_message(chat_id, f"📦 <b><code>{file_name}</code> received!</b>\n⏳ Installing dependencies in real-time...")
         res = subprocess.run([sys.executable, "-m", "pip", "install", "-r", scripts_path], capture_output=True, text=True)
         
         # Check if user had previously sent a Python file waiting for this requirements.txt
         if isinstance(current_state, dict) and current_state.get("action") == "WAITING_REQ_FOR_PY":
-            target_py = current_state.get("target_py", "bot.py")
+            target_py = current_state.get("target_py", target_py)
             user_states.pop(user_id, None)
             send_tg_message(chat_id, f"✅ <b>Dependencies installed!</b>\n🚀 Now auto-launching <code>{target_py}</code>...")
             ok_run, run_msg = start_child_app(target_py)
             send_tg_message(chat_id, run_msg, reply_markup=get_main_menu_keyboard())
         else:
             out_summary = res.stdout[-2000:] if res.stdout else "All requirements satisfied."
-            send_tg_message(chat_id, f"✅ <b>Dependencies Installed:</b>\n<pre>{out_summary}</pre>")
-            prompt_runner_menu(chat_id, user_id)
+            text = (
+                f"✅ <b>Dependencies Installed for <code>{target_py}</code>!</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📁 Linked to: <code>scripts/{file_name}</code>\n\n"
+                f"<pre>{html.escape(out_summary)}</pre>"
+            )
+            markup = {
+                "inline_keyboard": [
+                    [{"text": f"▶️ Run {target_py} Now", "callback_data": f"exec_run_{target_py}"}],
+                    [{"text": "🚀 Open Scripts Runner", "callback_data": "menu_runner"}],
+                    [{"text": "🔙 Main Menu", "callback_data": "menu_main"}]
+                ]
+            }
+            send_tg_message(chat_id, text, reply_markup=markup)
     
     # 2. If uploaded a .py script
     elif file_name.endswith(".py"):
