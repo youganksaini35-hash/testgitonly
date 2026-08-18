@@ -246,12 +246,22 @@ def get_script_req_path(py_filename):
     if base_name.endswith(".py"):
         base_name = base_name[:-3]
     
-    candidates = [
-        os.path.join(SCRIPTS_DIR, f"{base_name}.requirements.txt"),
-        os.path.join(SCRIPTS_DIR, f"{base_name}_requirements.txt"),
-        os.path.join(SCRIPTS_DIR, f"{base_name}_req.txt"),
-        os.path.join(SCRIPTS_DIR, f"{base_name}.req.txt")
-    ]
+    # Check directory of script if nested
+    dir_name = os.path.dirname(py_filename)
+    search_dirs = [SCRIPTS_DIR]
+    if dir_name:
+        search_dirs.insert(0, os.path.join(SCRIPTS_DIR, dir_name))
+    
+    candidates = []
+    for d in search_dirs:
+        candidates.extend([
+            os.path.join(d, f"{base_name}.requirements.txt"),
+            os.path.join(d, f"{base_name}_requirements.txt"),
+            os.path.join(d, f"{base_name}_req.txt"),
+            os.path.join(d, f"{base_name}.req.txt"),
+            os.path.join(d, "requirements.txt"),
+            os.path.join(d, "req.txt")
+        ])
     for c in candidates:
         if os.path.exists(c):
             return c
@@ -509,18 +519,31 @@ def start_child_app(filename="bot.py"):
     is_intentionally_stopped = False
     
     # Strip any prefix like scripts/
-    base_filename = os.path.basename(filename)
-    full_path = os.path.join(SCRIPTS_DIR, base_filename)
+    clean_name = filename.replace("scripts/", "").lstrip("/")
+    full_path = os.path.join(SCRIPTS_DIR, clean_name)
     
     if not os.path.exists(full_path):
-        # Fallback to workspace root if not in scripts
-        if os.path.exists(os.path.join(WORKSPACE_DIR, filename)):
+        base_filename = os.path.basename(filename)
+        # Search recursively inside SCRIPTS_DIR
+        found_path = None
+        for root, _, files in os.walk(SCRIPTS_DIR):
+            if base_filename in files:
+                found_path = os.path.join(root, base_filename)
+                break
+        if found_path and os.path.exists(found_path):
+            full_path = found_path
+            clean_name = os.path.relpath(found_path, SCRIPTS_DIR)
+        elif os.path.exists(os.path.join(WORKSPACE_DIR, filename)):
             full_path = os.path.join(WORKSPACE_DIR, filename)
+            clean_name = os.path.basename(filename)
         else:
-            return False, f"File <code>{base_filename}</code> not found in scripts folder."
+            return False, f"File <code>{clean_name}</code> not found in scripts folder."
     
+    base_filename = os.path.basename(clean_name)
+    script_working_dir = os.path.dirname(full_path) or SCRIPTS_DIR
+
     # Smart Auto-install: only if not already installed in current session
-    req_path = get_script_req_path(base_filename)
+    req_path = get_script_req_path(clean_name)
     if req_path:
         check_and_install_reqs(req_path)
 
@@ -540,13 +563,13 @@ def start_child_app(filename="bot.py"):
         child_logs = []
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
-        env["PYTHONPATH"] = f"{SCRIPTS_DIR}:{WORKSPACE_DIR}:{env.get('PYTHONPATH', '')}"
+        env["PYTHONPATH"] = f"{script_working_dir}:{SCRIPTS_DIR}:{WORKSPACE_DIR}:{env.get('PYTHONPATH', '')}"
         
         # Inject global env vars
         env.update(config.get("env_vars", {}))
         
         # Inject script-specific private .env variables!
-        script_private_env = read_script_env(base_filename)
+        script_private_env = read_script_env(clean_name)
         env.update(script_private_env)
         
         cmd = [sys.executable, "-u", full_path]
@@ -557,16 +580,16 @@ def start_child_app(filename="bot.py"):
             stdin=subprocess.DEVNULL,
             text=True,
             bufsize=1,
-            cwd=SCRIPTS_DIR, # All generated files (.db, .log, etc) will be saved in scripts/!
+            cwd=script_working_dir, # Run in project directory!
             env=env
         )
         child_process = proc
-        child_process_name = base_filename
+        child_process_name = clean_name
         child_process_start_time = time.time()
         
         threading.Thread(target=log_stream_reader, args=(proc.stdout,), daemon=True).start()
-        threading.Thread(target=child_watchdog, args=(proc, base_filename), daemon=True).start()
-        threading.Thread(target=resource_guard_monitor, args=(proc, base_filename), daemon=True).start()
+        threading.Thread(target=child_watchdog, args=(proc, clean_name), daemon=True).start()
+        threading.Thread(target=resource_guard_monitor, args=(proc, clean_name), daemon=True).start()
         
         # Initial health check (wait 1.5s to verify process stays alive)
         time.sleep(1.5)
@@ -936,9 +959,22 @@ def handle_text_message(chat_id, user_id, text):
 # Per-Script Environment Variables (.env) Engine
 # ---------------------------------------------------------------------------
 def get_script_env_path(py_filename):
-    base_name = os.path.basename(py_filename)
+    clean = py_filename.replace("scripts/", "").lstrip("/")
+    base_name = os.path.basename(clean)
     if base_name.endswith(".py"):
         base_name = base_name[:-3]
+    
+    # Check directory of script if nested
+    dir_name = os.path.dirname(clean)
+    if dir_name:
+        nested_env = os.path.join(SCRIPTS_DIR, dir_name, f"{base_name}.env")
+        if os.path.exists(nested_env):
+            return nested_env
+        nested_dot_env = os.path.join(SCRIPTS_DIR, dir_name, ".env")
+        if os.path.exists(nested_dot_env):
+            return nested_dot_env
+        return nested_env
+    
     return os.path.join(SCRIPTS_DIR, f"{base_name}.env")
 
 def read_script_env(py_filename):
@@ -1078,7 +1114,15 @@ def prompt_env_delete_list(chat_id, user_id, py_filename, message_id=None):
 # ---------------------------------------------------------------------------
 def prompt_runner_menu(chat_id, user_id, message_id=None):
     os.makedirs(SCRIPTS_DIR, exist_ok=True)
-    files = sorted([f for f in os.listdir(SCRIPTS_DIR) if f.endswith(".py")])
+    
+    # Scan all Python files recursively
+    files = []
+    for root, _, fs in os.walk(SCRIPTS_DIR):
+        for f in fs:
+            if f.endswith(".py") and not f.startswith("."):
+                rel = os.path.relpath(os.path.join(root, f), SCRIPTS_DIR)
+                files.append(rel)
+    files.sort()
     
     is_alive = child_process and child_process.poll() is None
     
@@ -1088,7 +1132,7 @@ def prompt_runner_menu(chat_id, user_id, message_id=None):
             "🚀 <b>Scripts Runner Manager</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "📁 No Python scripts found in <code>scripts/</code> folder.\n\n"
-            "💡 <i>You can send any <code>.py</code> file in chat to add it!</i>"
+            "💡 <i>You can send any <code>.py</code> or <code>.zip</code> file in chat to add it!</i>"
         )
     else:
         text = (
@@ -1116,7 +1160,7 @@ def prompt_runner_menu(chat_id, user_id, message_id=None):
             badge_str = f" [{', '.join(badges)}]"
             buttons.append([{"text": f"{btn_prefix}{py}{badge_str}", "callback_data": f"exec_run_{py}"}])
 
-    buttons.append([{"text": "📤 Upload New Script", "callback_data": "menu_upload_prompt"}])
+    buttons.append([{"text": "📤 Upload New Script / ZIP", "callback_data": "menu_upload_prompt"}])
     if is_alive:
         buttons.append([{"text": "🛑 Stop Current Script", "callback_data": "menu_stop"}])
     buttons.append([{"text": "🔙 Main Menu", "callback_data": "menu_main"}])
@@ -1558,8 +1602,112 @@ def handle_document_upload(chat_id, user_id, doc):
     
     current_state = user_states.get(user_id)
     
+    # 0. If uploaded a .zip project archive
+    if file_name.endswith(".zip"):
+        import zipfile
+        send_tg_message(chat_id, f"📦 <b>Unpacking Project Archive:</b> <code>{file_name}</code>...")
+        
+        extracted_files = []
+        try:
+            with zipfile.ZipFile(scripts_path, 'r') as zip_ref:
+                for member in zip_ref.namelist():
+                    filename_norm = os.path.normpath(member)
+                    if filename_norm.startswith("..") or filename_norm.startswith("/"):
+                        continue
+                    zip_ref.extract(member, SCRIPTS_DIR)
+                    extracted_files.append(member)
+            
+            try:
+                os.remove(scripts_path)
+            except Exception:
+                pass
+                
+        except Exception as e:
+            send_tg_message(chat_id, f"❌ Failed to extract zip: {e}")
+            return
+
+        # Scan extracted project for entry point, requirements, and env
+        all_py_files = []
+        found_reqs = []
+        found_envs = []
+        
+        for root, _, fs in os.walk(SCRIPTS_DIR):
+            for f in fs:
+                rel = os.path.relpath(os.path.join(root, f), SCRIPTS_DIR)
+                if rel.startswith("."):
+                    continue
+                if f.endswith(".py"):
+                    all_py_files.append(rel)
+                elif "requirements" in f.lower() and f.endswith(".txt"):
+                    found_reqs.append(os.path.join(root, f))
+                elif f.endswith(".env") or f == ".env":
+                    found_envs.append(os.path.join(root, f))
+
+        # Detect Primary Entry Point
+        entry_script = None
+        priority_names = ["main.py", "bot.py", "app.py", "run.py", "start.py", "server.py"]
+        for p in priority_names:
+            for py in all_py_files:
+                if os.path.basename(py).lower() == p:
+                    entry_script = py
+                    break
+            if entry_script:
+                break
+        if not entry_script and all_py_files:
+            entry_script = all_py_files[0]
+
+        # Auto-Install Requirements if found
+        req_installed_count = 0
+        if found_reqs:
+            for req in found_reqs:
+                rel_req = os.path.relpath(req, SCRIPTS_DIR)
+                send_tg_message(chat_id, f"⏳ Installing packages from <code>{rel_req}</code>...")
+                subprocess.run([sys.executable, "-m", "pip", "install", "-r", req], capture_output=True, text=True)
+                with open(req, "r", encoding="utf-8", errors="ignore") as rf:
+                    req_installed_count += len([l for l in rf if l.strip() and not l.startswith("#")])
+
+        # Auto-Load & Bind .env Variables
+        env_loaded_count = 0
+        if found_envs and entry_script:
+            for ef in found_envs:
+                parsed = {}
+                with open(ef, "r", encoding="utf-8", errors="ignore") as rf:
+                    for l in rf:
+                        l = l.strip()
+                        if "=" in l and not l.startswith("#"):
+                            k, v = l.split("=", 1)
+                            parsed[k.strip().upper()] = v.strip().strip("'\"")
+                if parsed:
+                    curr_env = read_script_env(entry_script)
+                    curr_env.update(parsed)
+                    write_script_env(entry_script, curr_env)
+                    env_loaded_count += len(parsed)
+
+        git_sync_to_github(f"Deploy ZIP project: {file_name}")
+
+        deploy_msg = (
+            f"🚀 <b>ZIP Project Deployed Successfully!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📦 <b>Archive:</b> <code>{file_name}</code>\n"
+            f"📁 <b>Files Extracted:</b> {len(extracted_files)}\n"
+            f"🎯 <b>Detected Entry Script:</b> <code>{entry_script or 'None'}</code>\n"
+            f"📦 <b>Dependencies:</b> {'Installed ~' + str(req_installed_count) + ' packages' if found_reqs else 'No requirements.txt found'}\n"
+            f"🔒 <b>Environment:</b> {str(env_loaded_count) + ' variables loaded' if env_loaded_count else 'No .env found'}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "<i>Click below to launch your project or manage environment:</i>"
+        )
+        buttons = []
+        if entry_script:
+            buttons.append([{"text": f"▶️ Launch {entry_script} Now", "callback_data": f"exec_run_{entry_script}"}])
+            buttons.append([{"text": f"⚙️ Configure {entry_script} ENV", "callback_data": f"env_dash_{entry_script}"}])
+        buttons.append([{"text": "🚀 Scripts Runner", "callback_data": "menu_runner"}, {"text": "📂 View Files", "callback_data": "menu_files"}])
+        buttons.append([{"text": "🔙 Main Menu", "callback_data": "menu_main"}])
+
+        send_tg_message(chat_id, deploy_msg, reply_markup={"inline_keyboard": buttons})
+        return
+
     # 1. If uploaded requirements file
-    if file_name.endswith(".requirements.txt") or file_name.endswith("_requirements.txt") or file_name.endswith("_req.txt") or file_name == "requirements.txt":
+    elif file_name.endswith(".requirements.txt") or file_name.endswith("_requirements.txt") or file_name.endswith("_req.txt") or file_name == "requirements.txt":
         # Extract target script name if named like bot.requirements.txt
         if file_name == "requirements.txt":
             target_py = "bot.py"
