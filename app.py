@@ -702,6 +702,7 @@ def show_logs_view(chat_id, message_id=None):
 def show_files_view(chat_id, message_id=None):
     os.makedirs(SCRIPTS_DIR, exist_ok=True)
     files = sorted([f for f in os.listdir(SCRIPTS_DIR) if not f.startswith(".") and f != "__pycache__"])
+    is_alive = child_process and child_process.poll() is None
     
     file_lines = []
     download_buttons = []
@@ -713,11 +714,26 @@ def show_files_view(chat_id, message_id=None):
             p = os.path.join(SCRIPTS_DIR, it)
             if os.path.isfile(p):
                 sz = os.path.getsize(p)
-                file_lines.append(f"• 📄 <code>{it}</code> ({sz} bytes)")
-                download_buttons.append([
-                    {"text": f"📥 {it}", "callback_data": f"file_dl_{it}"},
-                    {"text": "🗑️ Delete", "callback_data": f"file_del_{it}"}
-                ])
+                is_this_running = is_alive and child_process_name == it
+                status_icon = "🟢" if is_this_running else "📄"
+                file_lines.append(f"• {status_icon} <code>{it}</code> ({sz} bytes){' <b>[RUNNING]</b>' if is_this_running else ''}")
+                
+                if it.endswith(".py"):
+                    if is_this_running:
+                        run_btn = {"text": "🛑 Stop", "callback_data": "menu_stop"}
+                    else:
+                        run_btn = {"text": "▶️ Run", "callback_data": f"exec_run_{it}"}
+                    
+                    download_buttons.append([
+                        {"text": f"📥 {it}", "callback_data": f"file_dl_{it}"},
+                        run_btn,
+                        {"text": "🗑️ Delete", "callback_data": f"file_del_{it}"}
+                    ])
+                else:
+                    download_buttons.append([
+                        {"text": f"📥 {it}", "callback_data": f"file_dl_{it}"},
+                        {"text": "🗑️ Delete", "callback_data": f"file_del_{it}"}
+                    ])
     
     text = (
         "📂 <b>Scripts File Manager</b>\n"
@@ -725,8 +741,9 @@ def show_files_view(chat_id, message_id=None):
         f"📁 <b>Target Directory:</b> <code>scripts/</code> (GitHub Repository)\n"
         f"📊 <b>Total Files:</b> {len(files)}\n\n"
         + "\n".join(file_lines)
-        + "\n\n<i>Tap a file below to download or delete:</i>"
+        + "\n\n<i>Tap a button below to Download, Run, or Delete:</i>"
     )
+    download_buttons.append([{"text": "🚀 Scripts Runner", "callback_data": "menu_runner"}])
     download_buttons.append([{"text": "📤 Upload New Script", "callback_data": "menu_upload_prompt"}])
     download_buttons.append([{"text": "🔙 Main Menu", "callback_data": "menu_main"}])
     markup = {"inline_keyboard": download_buttons}
