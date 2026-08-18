@@ -289,9 +289,12 @@ def start_child_app(filename="bot.py"):
         child_logs = []
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
-        # Ensure python path includes scripts folder so all local modules import smoothly
-        env["PYTHONPATH"] = f"{SCRIPTS_DIR}:{WORKSPACE_DIR}:{env.get('PYTHONPATH', '')}"
+        # Inject global env vars
         env.update(config.get("env_vars", {}))
+        
+        # Inject script-specific private .env variables!
+        script_private_env = read_script_env(base_filename)
+        env.update(script_private_env)
         
         cmd = [sys.executable, "-u", full_path]
         proc = subprocess.Popen(
@@ -433,11 +436,14 @@ def get_main_menu_keyboard():
                 {"text": "📋 Live Logs", "callback_data": "menu_logs"}
             ],
             [
-                {"text": "📂 Workspace Files", "callback_data": "menu_files"},
-                {"text": "📦 Install Pip", "callback_data": "menu_pip_prompt"}
+                {"text": "⚙️ Script ENVs", "callback_data": "menu_env_select"},
+                {"text": "📂 Workspace Files", "callback_data": "menu_files"}
             ],
             [
-                {"text": "💻 Linux Shell", "callback_data": "menu_sh_prompt"},
+                {"text": "📦 Install Pip", "callback_data": "menu_pip_prompt"},
+                {"text": "💻 Linux Shell", "callback_data": "menu_sh_prompt"}
+            ],
+            [
                 {"text": "💾 Cloud Sync", "callback_data": "menu_sync"}
             ]
         ]
@@ -529,6 +535,43 @@ def handle_text_message(chat_id, user_id, text):
         send_tg_message(chat_id, result_msg, reply_markup=get_main_menu_keyboard())
         return
 
+    elif isinstance(state, dict) and state.get("action") == "WAITING_ENV_VAR":
+        target_py = state.get("target_py", "bot.py")
+        user_states.pop(user_id, None)
+        
+        if "=" in raw_text:
+            key, val = raw_text.split("=", 1)
+            key = key.strip().upper()
+            val = val.strip()
+            
+            env_dict = read_script_env(target_py)
+            env_dict[key] = val
+            ok, msg = write_script_env(target_py, env_dict)
+            
+            masked = mask_secret_val(val)
+            base_n = target_py.rsplit('.', 1)[0]
+            confirm_text = (
+                f"✅ <b>Variable Saved for <code>{target_py}</code>!</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"• 🔑 <code>{key}</code> = <code>{masked}</code>\n\n"
+                f"📁 Saved to dedicated <code>scripts/{base_n}.env</code> and synced to GitHub!"
+            )
+            markup = {
+                "inline_keyboard": [
+                    [{"text": f"⚙️ Manage {target_py} ENV", "callback_data": f"env_dash_{target_py}"}],
+                    [{"text": f"▶️ Run {target_py}", "callback_data": f"exec_run_{target_py}"}],
+                    [{"text": "🔙 Main Menu", "callback_data": "menu_main"}]
+                ]
+            }
+            send_tg_message(chat_id, confirm_text, reply_markup=markup)
+        else:
+            send_tg_message(
+                chat_id,
+                "⚠️ <b>Invalid Format!</b>\n\nKripya <code>KEY=VALUE</code> format me bhejein.\n(Example: <code>BOT_TOKEN=123456:AAH...</code>)",
+                reply_markup={"inline_keyboard": [[{"text": "🔙 Back", "callback_data": f"env_dash_{target_py}"}]]}
+            )
+        return
+
     elif state == "WAITING_RUN_FILE":
         user_states.pop(user_id, None)
         filename = raw_text
@@ -545,6 +588,9 @@ def handle_text_message(chat_id, user_id, text):
     elif raw_text == "/status":
         send_tg_message(chat_id, render_dashboard_text(), reply_markup=get_main_menu_keyboard())
     
+    elif raw_text in ["/env", "/envs", "/config"]:
+        prompt_env_script_select(chat_id, user_id)
+
     elif raw_text.startswith("/run"):
         parts = raw_text.split()
         if len(parts) > 1:
@@ -619,6 +665,147 @@ def handle_text_message(chat_id, user_id, text):
     else:
         # If user just types text, show dashboard
         send_tg_message(chat_id, render_dashboard_text(), reply_markup=get_main_menu_keyboard())
+
+# ---------------------------------------------------------------------------
+# Per-Script Environment Variables (.env) Engine
+# ---------------------------------------------------------------------------
+def get_script_env_path(py_filename):
+    base_name = os.path.basename(py_filename)
+    if base_name.endswith(".py"):
+        base_name = base_name[:-3]
+    return os.path.join(SCRIPTS_DIR, f"{base_name}.env")
+
+def read_script_env(py_filename):
+    env_path = get_script_env_path(py_filename)
+    env_dict = {}
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip("'\"")
+                        env_dict[k] = v
+        except Exception as e:
+            logger.error(f"Error reading env for {py_filename}: {e}")
+    return env_dict
+
+def write_script_env(py_filename, env_dict):
+    env_path = get_script_env_path(py_filename)
+    os.makedirs(SCRIPTS_DIR, exist_ok=True)
+    try:
+        with open(env_path, "w", encoding="utf-8") as f:
+            for k, v in sorted(env_dict.items()):
+                f.write(f"{k}={v}\n")
+        base_name = os.path.basename(py_filename)
+        git_sync_to_github(f"Update private env for {base_name}")
+        return True, "Env saved successfully."
+    except Exception as e:
+        return False, f"Error saving env: {e}"
+
+def mask_secret_val(val):
+    if not val:
+        return "(empty)"
+    if len(val) <= 6:
+        return "***"
+    return f"{val[:3]}...{val[-3:]}"
+
+def prompt_env_script_select(chat_id, user_id, message_id=None):
+    os.makedirs(SCRIPTS_DIR, exist_ok=True)
+    files = sorted([f for f in os.listdir(SCRIPTS_DIR) if f.endswith(".py")])
+    
+    buttons = []
+    if not files:
+        text = (
+            "⚙️ <b>Per-Script Environment (.env) Manager</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📁 <code>scripts/</code> folder me abhi koi Python file nahi mili.\n\n"
+            "💡 <i>Aap chat me nayi script (.py) bhej sakte hain.</i>"
+        )
+    else:
+        text = (
+            "⚙️ <b>Per-Script Environment (.env) Manager</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Har script ka apna private <b><code>.env</code></b> hota hai jo sirf uske run hone par inject hota hai.\n\n"
+            "<i>Neeche script select karein jiske variables view/edit karne hain:</i>"
+        )
+        for py in files:
+            env_vars = read_script_env(py)
+            count = len(env_vars)
+            badge = f"({count} vars set)" if count > 0 else "(0 vars)"
+            buttons.append([{"text": f"📁 {py} {badge}", "callback_data": f"env_dash_{py}"}])
+    
+    buttons.append([{"text": "🔙 Main Menu", "callback_data": "menu_main"}])
+    markup = {"inline_keyboard": buttons}
+    if message_id:
+        edit_tg_message(chat_id, message_id, text, reply_markup=markup)
+    else:
+        send_tg_message(chat_id, text, reply_markup=markup)
+
+def prompt_script_env_dashboard(chat_id, user_id, py_filename, message_id=None):
+    env_vars = read_script_env(py_filename)
+    is_this_running = (child_process and child_process.poll() is None and child_process_name == py_filename)
+    
+    var_lines = []
+    if not env_vars:
+        var_lines.append("<i>Abhi is script ke liye koi private variable set nahi hai.</i>")
+    else:
+        for k, v in sorted(env_vars.items()):
+            masked = mask_secret_val(v)
+            var_lines.append(f"• 🔑 <code>{k}</code> = <code>{masked}</code>")
+    
+    base_name = py_filename.rsplit('.', 1)[0]
+    text = (
+        f"⚙️ <b>Private Environment:</b> <code>scripts/{py_filename}</code>\n"
+        f"📁 <b>Dedicated Config:</b> <code>scripts/{base_name}.env</code>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        + "\n".join(var_lines)
+        + "\n\n<i>Neeche button se variable add karein ya delete karein:</i>"
+    )
+    
+    buttons = [
+        [
+            {"text": "➕ Add / Edit Variable", "callback_data": f"env_add_{py_filename}"},
+            {"text": "🗑️ Delete Variable", "callback_data": f"env_del_list_{py_filename}"}
+        ],
+        [
+            {"text": f"📥 Export {base_name}.env", "callback_data": f"env_exp_{py_filename}"}
+        ]
+    ]
+    if is_this_running:
+        buttons.append([{"text": "🔄 Apply & Restart Script", "callback_data": "menu_restart"}])
+    else:
+        buttons.append([{"text": f"▶️ Run {py_filename} Now", "callback_data": f"exec_run_{py_filename}"}])
+    
+    buttons.append([{"text": "🔙 Back to Scripts", "callback_data": "menu_env_select"}])
+    markup = {"inline_keyboard": buttons}
+    
+    if message_id:
+        edit_tg_message(chat_id, message_id, text, reply_markup=markup)
+    else:
+        send_tg_message(chat_id, text, reply_markup=markup)
+
+def prompt_env_delete_list(chat_id, user_id, py_filename, message_id=None):
+    env_vars = read_script_env(py_filename)
+    if not env_vars:
+        text = f"ℹ️ <code>{py_filename}</code> me delete karne ke liye koi variable nahi hai."
+        markup = {"inline_keyboard": [[{"text": "🔙 Back", "callback_data": f"env_dash_{py_filename}"}]]}
+    else:
+        text = f"🗑️ <b>Delete Variable from <code>{py_filename}</code>:</b>\n\nNeeche kisi variable par tap karke use remove karein:"
+        buttons = []
+        for k in sorted(env_vars.keys()):
+            buttons.append([{"text": f"❌ Delete {k}", "callback_data": f"env_dodel_{py_filename}_{k}"}])
+        buttons.append([{"text": "🔙 Back", "callback_data": f"env_dash_{py_filename}"}])
+        markup = {"inline_keyboard": buttons}
+    
+    if message_id:
+        edit_tg_message(chat_id, message_id, text, reply_markup=markup)
+    else:
+        send_tg_message(chat_id, text, reply_markup=markup)
 
 # ---------------------------------------------------------------------------
 # Interactive Submenus
@@ -830,6 +1017,63 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
         answer_callback(callback_id, "📊 Status Refreshed!")
         edit_tg_message(chat_id, message_id, render_dashboard_text(), reply_markup=get_main_menu_keyboard())
 
+    # 2b. Script ENV Menu
+    elif data == "menu_env_select":
+        answer_callback(callback_id)
+        prompt_env_script_select(chat_id, user_id, message_id)
+
+    # 2c. Specific Script ENV Dashboard
+    elif data.startswith("env_dash_"):
+        fname = data.replace("env_dash_", "")
+        answer_callback(callback_id)
+        prompt_script_env_dashboard(chat_id, user_id, fname, message_id)
+
+    # 2d. Add/Edit Variable Prompt
+    elif data.startswith("env_add_"):
+        fname = data.replace("env_add_", "")
+        user_states[user_id] = {
+            "action": "WAITING_ENV_VAR",
+            "target_py": fname
+        }
+        answer_callback(callback_id)
+        text = (
+            f"⚙️ <b>Set Environment Variable for <code>{fname}</code></b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Abhi chat me variable ka naam aur value bhej dein:\n\n"
+            "• <b>Format:</b> <code>KEY=VALUE</code>\n"
+            "• <b>Example:</b> <code>BOT_TOKEN=123456789:AAH...</code>\n"
+            "• <b>Example:</b> <code>GMAIL_EMAIL=mybot@gmail.com</code>\n\n"
+            "<i>Yeh variable dedicated <code>scripts/{fname.rsplit('.', 1)[0]}.env</code> me save hoga.</i>"
+        )
+        edit_tg_message(chat_id, message_id, text, reply_markup={"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": f"env_dash_{fname}"}]]})
+
+    # 2e. Delete Variable Menu
+    elif data.startswith("env_del_list_"):
+        fname = data.replace("env_del_list_", "")
+        answer_callback(callback_id)
+        prompt_env_delete_list(chat_id, user_id, fname, message_id)
+
+    # 2f. Do Delete Variable
+    elif data.startswith("env_dodel_"):
+        parts = data.replace("env_dodel_", "").split("_", 1)
+        if len(parts) == 2:
+            fname, var_key = parts[0], parts[1]
+            env_dict = read_script_env(fname)
+            env_dict.pop(var_key, None)
+            write_script_env(fname, env_dict)
+            answer_callback(callback_id, f"{var_key} deleted!", show_alert=True)
+            prompt_script_env_dashboard(chat_id, user_id, fname, message_id)
+
+    # 2g. Export .env file
+    elif data.startswith("env_exp_"):
+        fname = data.replace("env_exp_", "")
+        env_path = get_script_env_path(fname)
+        if os.path.exists(env_path):
+            answer_callback(callback_id, f"Exporting {fname.rsplit('.', 1)[0]}.env...")
+            send_tg_document(chat_id, env_path, caption=f"📄 <b>{os.path.basename(env_path)}</b>")
+        else:
+            answer_callback(callback_id, "No .env file found for this script.", show_alert=True)
+
     # 3. Runner Menu
     elif data in ["menu_runner", "menu_run_select"]:
         answer_callback(callback_id)
@@ -1034,6 +1278,27 @@ def handle_document_upload(chat_id, user_id, doc):
             "inline_keyboard": [
                 [{"text": f"▶️ Run {file_name} Now", "callback_data": f"exec_run_{file_name}"}],
                 [{"text": "🚀 Open Scripts Runner", "callback_data": "menu_runner"}],
+                [{"text": "🔙 Main Menu", "callback_data": "menu_main"}]
+            ]
+        }
+        send_tg_message(chat_id, text, reply_markup=markup)
+
+    # 3. If uploaded a .env file
+    elif file_name.endswith(".env") or file_name == ".env":
+        target_py = "bot.py" if file_name == ".env" else file_name[:-4] + ".py"
+        parsed_vars = read_script_env(target_py)
+        count = len(parsed_vars)
+        text = (
+            f"🔒 <b>Environment File Saved:</b> <code>scripts/{file_name}</code>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"• <b>Linked Script:</b> <code>scripts/{target_py}</code>\n"
+            f"• <b>Total Variables Loaded:</b> {count}\n\n"
+            f"📁 Saved and synced to GitHub repository."
+        )
+        markup = {
+            "inline_keyboard": [
+                [{"text": f"⚙️ Manage {target_py} ENV", "callback_data": f"env_dash_{target_py}"}],
+                [{"text": f"▶️ Run {target_py}", "callback_data": f"exec_run_{target_py}"}],
                 [{"text": "🔙 Main Menu", "callback_data": "menu_main"}]
             ]
         }
