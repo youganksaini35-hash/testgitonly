@@ -436,6 +436,8 @@ def start_child_app(filename="bot.py"):
             )
         
         req_note = f" (📦 {os.path.basename(req_path)})" if req_path else " (📄 Standalone)"
+        config["active_script"] = base_filename
+        save_config(config)
         return True, f"✨ <b>{base_filename}</b> started successfully!{req_note}\n🆔 Process ID: <code>{proc.pid}</code>\n🟢 State: Active (Running)"
     except Exception as e:
         return False, f"❌ Start error: {e}"
@@ -443,7 +445,7 @@ def start_child_app(filename="bot.py"):
 def stop_child_app():
     global child_process, child_process_name, child_process_start_time, is_intentionally_stopped
     is_intentionally_stopped = True
-    config["auto_run_file"] = None
+    config["active_script"] = None
     save_config(config)
     
     stopped_any = False
@@ -1544,7 +1546,11 @@ def main():
     logger.info(f"🚀 Telegram Relay Controller Initialized [Run #{RUN_ID}]")
     logger.info("=" * 60)
     
-    # NOTE: User scripts DO NOT auto-start on boot. Only Telegram controller runs and waits for Admin to launch scripts via Runner menu.
+    # Seamless Relay Persistence: If a script was actively running before handoff, resume it!
+    last_active = config.get("active_script")
+    if last_active:
+        logger.info(f"🔄 Auto-resuming active script across relay handoff: {last_active}")
+        threading.Thread(target=start_child_app, args=(last_active,), daemon=True).start()
 
     # Start Telegram polling thread
     tg_thread = threading.Thread(target=telegram_polling_loop, daemon=True, name="TGPolling")
