@@ -1194,25 +1194,28 @@ def prompt_runner_menu(chat_id, user_id, message_id=None):
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             f"• <b>Active Process:</b> {'🟢 ' + child_process_name if is_alive else '🔴 None (Stopped)'}\n"
             f"• <b>Total Runnable Scripts:</b> {len(runnable_files)}\n\n"
-            "<i>Tap any script below to launch it:</i>"
+            "<i>Tap <b>▶️ Run</b> to execute or <b>🗑️ Delete</b> to remove:</i>"
         )
         for py in runnable_files:
             is_this_running = is_alive and child_process_name == py
-            btn_prefix = "🟢 [RUNNING] " if is_this_running else "▶️ Run "
             
             req_p = get_script_req_path(py)
             has_env = len(read_script_env(py)) > 0
             
             badges = []
             if req_p:
-                badges.append("📦 Batch Reqs")
-            else:
-                badges.append("📄 Standalone")
+                badges.append("📦")
             if has_env:
-                badges.append("🔒 .env")
-                
-            badge_str = f" [{', '.join(badges)}]"
-            buttons.append([{"text": f"{btn_prefix}{py}{badge_str}", "callback_data": f"exec_run_{py}"}])
+                badges.append("🔒")
+            badge_str = f" {' '.join(badges)}" if badges else ""
+            
+            if is_this_running:
+                run_btn = {"text": f"🛑 Stop {py}{badge_str}", "callback_data": "menu_stop"}
+            else:
+                run_btn = {"text": f"▶️ Run {py}{badge_str}", "callback_data": f"exec_run_{py}"}
+            
+            del_btn = {"text": "🗑️ Delete", "callback_data": f"file_del_{py}"}
+            buttons.append([run_btn, del_btn])
 
     buttons.append([{"text": "📤 Upload New Script / ZIP", "callback_data": "menu_upload_prompt"}])
     if is_alive:
