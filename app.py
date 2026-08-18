@@ -36,19 +36,22 @@ RUN_DURATION_SECONDS = int(os.environ.get("RUN_DURATION_SECONDS", "19800"))
 START_TIME = time.time()
 IS_RUNNING = True
 
-# Path to state / config
+# Workspace & Config
 WORKSPACE_DIR = os.getcwd()
 CONFIG_FILE = os.path.join(WORKSPACE_DIR, "bot_config.json")
 
-# Process state
+# State & Processes
 child_process = None
 child_process_name = None
 child_process_start_time = None
 child_logs = []
 LOG_BUFFER_MAX = 200
 
+# User conversation states (for interactive step-by-step inputs)
+user_states = {}
+
 # ---------------------------------------------------------------------------
-# Telegram API Helper Functions
+# Telegram API Helpers (Buttons & Messages)
 # ---------------------------------------------------------------------------
 TG_BASE_URL = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
@@ -70,54 +73,70 @@ def save_config(cfg):
 
 config = load_config()
 
-def send_tg_message(chat_id, text, parse_mode="HTML"):
-    """Send message to Telegram with auto-chunking for long text."""
+def send_tg_message(chat_id, text, reply_markup=None, parse_mode="HTML"):
     url = f"{TG_BASE_URL}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": parse_mode
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     
-    # Split text if exceeding Telegram's 4000 character limit
-    max_len = 3900
-    chunks = [text[i:i+max_len] for i in range(0, len(text), max_len)]
-    
-    for chunk in chunks:
-        try:
-            payload = {
-                "chat_id": chat_id,
-                "text": chunk,
-                "parse_mode": parse_mode
-            }
-            requests.post(url, json=payload, timeout=10)
-        except Exception as e:
-            # Fallback without parse mode in case of formatting error
-            try:
-                payload = {"chat_id": chat_id, "text": chunk}
-                requests.post(url, json=payload, timeout=10)
-            except Exception as e2:
-                logger.error(f"Failed to send Telegram message: {e2}")
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        return resp.json()
+    except Exception as e:
+        logger.error(f"Failed to send Telegram message: {e}")
+        return None
+
+def edit_tg_message(chat_id, message_id, text, reply_markup=None, parse_mode="HTML"):
+    url = f"{TG_BASE_URL}/editMessageText"
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": parse_mode
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        logger.error(f"Failed to edit message: {e}")
+
+def answer_callback(callback_query_id, text=None, show_alert=False):
+    url = f"{TG_BASE_URL}/answerCallbackQuery"
+    payload = {"callback_query_id": callback_query_id}
+    if text:
+        payload["text"] = text
+        payload["show_alert"] = show_alert
+    try:
+        requests.post(url, json=payload, timeout=5)
+    except Exception:
+        pass
 
 def send_tg_document(chat_id, filepath, caption=""):
     url = f"{TG_BASE_URL}/sendDocument"
     try:
         with open(filepath, "rb") as f:
             files = {"document": f}
-            data = {"chat_id": chat_id, "caption": caption}
-            requests.post(url, data=data, files=files, timeout=20)
+            data = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
+            requests.post(url, data=data, files=files, timeout=30)
     except Exception as e:
-        send_tg_message(chat_id, f"❌ Failed to send document: {e}", parse_mode=None)
+        send_tg_message(chat_id, f"❌ Failed to send document: {e}")
 
 def download_tg_file(file_id, destination_path):
-    """Download a file uploaded to Telegram."""
     try:
-        # Step 1: Get file path
         url = f"{TG_BASE_URL}/getFile?file_id={file_id}"
         resp = requests.get(url, timeout=10).json()
         if not resp.get("ok"):
-            return False, "Could not get file path from Telegram."
+            return False, "Could not retrieve file path from Telegram."
         
         file_path = resp["result"]["file_path"]
         download_url = f"https://api.telegram.org/file/bot{TG_BOT_TOKEN}/{file_path}"
         
-        # Step 2: Download file content
-        file_resp = requests.get(download_url, timeout=30)
+        file_resp = requests.get(download_url, timeout=45)
         if file_resp.status_code == 200:
             with open(destination_path, "wb") as f:
                 f.write(file_resp.content)
@@ -127,34 +146,32 @@ def download_tg_file(file_id, destination_path):
         return False, str(e)
 
 # ---------------------------------------------------------------------------
-# GitHub Git Auto-Sync (Sync changes back to GitHub Repo across handoffs)
+# GitHub Git Auto-Sync
 # ---------------------------------------------------------------------------
-def git_sync_to_github(commit_message="Update from Telegram Bot Controller"):
-    """Commits and pushes local workspace changes to GitHub."""
+def git_sync_to_github(commit_message="Update via Telegram Controller"):
     if not GH_PAT or not REPO:
-        return False, "GH_PAT or REPO not set"
+        return False, "GitHub Token or Repo not set"
     
     try:
         remote_url = f"https://{GH_PAT}@github.com/{REPO}.git"
-        subprocess.run(["git", "config", "user.name", "RelayBotController"], check=True)
-        subprocess.run(["git", "config", "user.email", "bot@relay.local"], check=True)
+        subprocess.run(["git", "config", "user.name", "TelegramController"], check=True)
+        subprocess.run(["git", "config", "user.email", "bot@controller.local"], check=True)
         subprocess.run(["git", "add", "."], check=True)
         
-        # Check if there are changes to commit
         status = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
         if not status.stdout.strip():
-            return True, "No changes to sync"
+            return True, "All files already up to date."
         
         subprocess.run(["git", "commit", "-m", commit_message], check=True)
         push_res = subprocess.run(["git", "push", remote_url, "main"], capture_output=True, text=True)
         if push_res.returncode == 0:
-            return True, "Synced to GitHub successfully!"
+            return True, "Successfully synced to GitHub!"
         return False, push_res.stderr
     except Exception as e:
         return False, str(e)
 
 # ---------------------------------------------------------------------------
-# Child Process Management (Run, Stop, Restart Python Scripts)
+# Process Manager (Run, Stop, Restart Scripts)
 # ---------------------------------------------------------------------------
 def append_log(line):
     global child_logs
@@ -165,14 +182,13 @@ def append_log(line):
         child_logs.pop(0)
 
 def log_stream_reader(pipe):
-    """Background thread to read output from child process."""
     try:
         for line in iter(pipe.readline, ''):
             if not line:
                 break
-            clean_line = line.rstrip()
-            append_log(clean_line)
-            logger.info(f"[ChildApp] {clean_line}")
+            clean = line.rstrip()
+            append_log(clean)
+            logger.info(f"[ChildApp] {clean}")
         pipe.close()
     except Exception:
         pass
@@ -181,9 +197,8 @@ def start_child_app(filename="bot.py"):
     global child_process, child_process_name, child_process_start_time
     
     if not os.path.exists(filename):
-        return False, f"File <code>{filename}</code> not found in workspace!"
+        return False, f"File <b>{filename}</b> workspace me nahi mili."
     
-    # If already running, stop first
     if child_process and child_process.poll() is None:
         stop_child_app()
     
@@ -204,12 +219,10 @@ def start_child_app(filename="bot.py"):
         config["auto_run_file"] = filename
         save_config(config)
         
-        # Start log reader thread
         threading.Thread(target=log_stream_reader, args=(child_process.stdout,), daemon=True).start()
-        
-        return True, f"✅ Started <code>{filename}</code> (PID: {child_process.pid})"
+        return True, f"✨ <b>{filename}</b> successfully start ho gaya!\n🆔 Process ID: <code>{child_process.pid}</code>"
     except Exception as e:
-        return False, f"❌ Failed to start: {e}"
+        return False, f"❌ Start error: {e}"
 
 def stop_child_app():
     global child_process, child_process_name, child_process_start_time
@@ -217,18 +230,17 @@ def stop_child_app():
         name = child_process_name
         try:
             child_process.terminate()
-            child_process.wait(timeout=5)
+            child_process.wait(timeout=4)
         except subprocess.TimeoutExpired:
             child_process.kill()
         
         child_process = None
         child_process_name = None
         child_process_start_time = None
-        return True, f"🛑 Stopped <code>{name}</code>"
-    return False, "No child script is currently running."
+        return True, f"🛑 <b>{name}</b> ko stop kar diya gaya."
+    return False, "Abhi koi script run nahi ho rahi hai."
 
 def restart_child_app():
-    global child_process_name
     file_to_run = child_process_name or config.get("auto_run_file", "bot.py")
     stop_child_app()
     time.sleep(1)
@@ -249,212 +261,423 @@ def trigger_next_runner():
         resp = requests.post(url, headers=headers, json=payload, timeout=15)
         return resp.status_code == 204
     except Exception as e:
-        logger.error(f"Error triggering workflow: {e}")
+        logger.error(f"Workflow dispatch error: {e}")
         return False
 
 # ---------------------------------------------------------------------------
-# Telegram Command Handlers
+# Visual UI & Keyboards
 # ---------------------------------------------------------------------------
-def handle_command(chat_id, user_id, text):
-    global config
+def get_main_menu_keyboard():
+    is_alive = child_process and child_process.poll() is None
+    status_btn = "🟢 Script: RUNNING" if is_alive else "🔴 Script: STOPPED"
     
-    # Authenticate / Claim Admin
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📊 Server Status", "callback_data": "menu_status"},
+                {"text": status_btn, "callback_data": "menu_status"}
+            ],
+            [
+                {"text": "🚀 Run Python File", "callback_data": "menu_run_select"},
+                {"text": "🛑 Stop Script", "callback_data": "menu_stop"}
+            ],
+            [
+                {"text": "🔄 Restart Script", "callback_data": "menu_restart"},
+                {"text": "📋 Live Logs", "callback_data": "menu_logs"}
+            ],
+            [
+                {"text": "📂 Workspace Files", "callback_data": "menu_files"},
+                {"text": "📦 Install Pip Package", "callback_data": "menu_pip_prompt"}
+            ],
+            [
+                {"text": "💻 Shell Terminal", "callback_data": "menu_sh_prompt"},
+                {"text": "💾 Sync to GitHub", "callback_data": "menu_sync"}
+            ]
+        ]
+    }
+
+def get_back_keyboard():
+    return {
+        "inline_keyboard": [
+            [{"text": "🔙 Main Menu", "callback_data": "menu_main"}]
+        ]
+    }
+
+def render_dashboard_text():
+    uptime_sec = int(time.time() - START_TIME)
+    hours, remainder = divmod(uptime_sec, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    
+    is_alive = child_process and child_process.poll() is None
+    child_status = "🟢 Active (Running)" if is_alive else "🔴 Inactive (Stopped)"
+    
+    child_uptime_str = "N/A"
+    if is_alive and child_process_start_time:
+        cu_sec = int(time.time() - child_process_start_time)
+        ch, cr = divmod(cu_sec, 3600)
+        cm, cs = divmod(cr, 60)
+        child_uptime_str = f"{ch}h {cm}m {cs}s"
+
+    ram = psutil.virtual_memory()
+    cpu = psutil.cpu_percent(interval=None)
+
+    text = (
+        "⚡ <b>24/7 Cloud Relay Control Panel</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🖥️ <b>Server Host:</b> GitHub Actions (Ubuntu)\n"
+        f"⏱️ <b>Runner Uptime:</b> {hours}h {minutes}m {seconds}s\n"
+        f"⚙️ <b>Active Script:</b> <code>{child_process_name or 'None'}</code>\n"
+        f"📊 <b>Script State:</b> {child_status}\n"
+        f"⏳ <b>Script Uptime:</b> {child_uptime_str}\n"
+        f"💾 <b>RAM Usage:</b> {ram.percent}% ({ram.used // (1024*1024)}MB / {ram.total // (1024*1024)}MB)\n"
+        f"📈 <b>CPU Load:</b> {cpu}%\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "💡 <i>Aap koi bhi .py file ya requirements.txt direct chat me bhej sakte hain!</i>"
+    )
+    return text
+
+# ---------------------------------------------------------------------------
+# Message & Interactive Step Handler
+# ---------------------------------------------------------------------------
+def handle_text_message(chat_id, user_id, text):
+    global user_states
+    
+    # 1. Admin Authentication / Registration
     if config["admin_id"] is None:
         config["admin_id"] = user_id
         save_config(config)
-        send_tg_message(chat_id, f"👑 <b>Admin Registered!</b> Your User ID: <code>{user_id}</code> is now the authorized master of this server.")
+        send_tg_message(chat_id, f"👑 <b>Admin Registered!</b>\nUser ID: <code>{user_id}</code> is now the master owner.")
     
     if user_id != config["admin_id"]:
-        send_tg_message(chat_id, "⛔ <b>Access Denied:</b> You are not authorized to control this runner.")
+        send_tg_message(chat_id, "⛔ <b>Access Denied:</b> You are not authorized.")
         return
 
-    parts = text.strip().split()
-    cmd = parts[0].lower()
-    args = parts[1:] if len(parts) > 1 else []
+    raw_text = text.strip()
+    state = user_states.get(user_id)
 
-    # 1. /start or /help
-    if cmd in ["/start", "/help"]:
-        help_text = (
-            "⚡ <b>24/7 Cloud Relay Bot Controller</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>🎮 Process Controls:</b>\n"
-            "• <code>/run &lt;file.py&gt;</code> - Start a python script\n"
-            "• <code>/stop</code> - Stop the running script\n"
-            "• <code>/restart</code> - Restart the current script\n"
-            "• <code>/status</code> - Show runner & process status\n"
-            "• <code>/logs [n]</code> - View last N lines of logs (default: 25)\n\n"
-            "<b>📁 File & Code Management:</b>\n"
-            "• <i>Just send any .py or text file in chat to upload!</i>\n"
-            "• <i>Send requirements.txt to auto-install dependencies!</i>\n"
-            "• <code>/files</code> - List all files in workspace\n"
-            "• <code>/download &lt;file&gt;</code> - Download file to Telegram\n"
-            "• <code>/delete &lt;file&gt;</code> - Delete a file\n"
-            "• <code>/sync</code> - Save & push changes to GitHub\n\n"
-            "<b>💻 Shell & Package Manager:</b>\n"
-            "• <code>/pip &lt;package&gt;</code> - Install Python package\n"
-            "• <code>/sh &lt;command&gt;</code> - Execute Linux shell command\n"
-            "• <code>/stats</code> - Server CPU, RAM & Uptime"
+    # Check for cancel command
+    if raw_text in ["/cancel", "Cancel", "❌ Cancel"]:
+        user_states.pop(user_id, None)
+        send_tg_message(chat_id, "❌ Action cancelled.", reply_markup=get_main_menu_keyboard())
+        return
+
+    # Check state machine for pending interactive inputs
+    if state == "WAITING_PIP_PACKAGE":
+        user_states.pop(user_id, None)
+        pkg_name = raw_text.replace("pip install", "").strip()
+        send_tg_message(chat_id, f"⏳ <b>Installing package:</b> <code>{pkg_name}</code>...")
+        res = subprocess.run([sys.executable, "-m", "pip", "install", pkg_name], capture_output=True, text=True)
+        out = (res.stdout + "\n" + res.stderr).strip()
+        result_msg = (
+            f"📦 <b>Package: {pkg_name}</b>\n\n"
+            f"<pre>{out[-2500:]}</pre>"
         )
-        send_tg_message(chat_id, help_text)
+        send_tg_message(chat_id, result_msg, reply_markup=get_main_menu_keyboard())
+        return
 
-    # 2. /status
-    elif cmd == "/status":
-        uptime_sec = int(time.time() - START_TIME)
-        hours, remainder = divmod(uptime_sec, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        
-        is_child_alive = child_process and child_process.poll() is None
-        child_status = "🟢 Running" if is_child_alive else "🔴 Stopped"
-        
-        child_uptime_str = "N/A"
-        if is_child_alive and child_process_start_time:
-            cu_sec = int(time.time() - child_process_start_time)
-            ch, cr = divmod(cu_sec, 3600)
-            cm, cs = divmod(cr, 60)
-            child_uptime_str = f"{ch}h {cm}m {cs}s"
-
-        ram = psutil.virtual_memory()
-        cpu = psutil.cpu_percent(interval=None)
-
-        status_msg = (
-            "📊 <b>System & Runner Status</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"• <b>Relay Runner:</b> 🟢 Online (Run #{RUN_ID})\n"
-            f"• <b>Runner Uptime:</b> {hours}h {minutes}m {seconds}s\n"
-            f"• <b>Active Script:</b> <code>{child_process_name or 'None'}</code>\n"
-            f"• <b>Script State:</b> {child_status}\n"
-            f"• <b>Script Uptime:</b> {child_uptime_str}\n"
-            f"• <b>RAM Usage:</b> {ram.percent}% ({ram.used // (1024*1024)}MB / {ram.total // (1024*1024)}MB)\n"
-            f"• <b>CPU Load:</b> {cpu}%\n"
-            f"• <b>Auto-Sync Repo:</b> <code>{REPO}</code>"
+    elif state == "WAITING_SHELL_CMD":
+        user_states.pop(user_id, None)
+        send_tg_message(chat_id, f"⚡ <b>Executing:</b> <code>{raw_text}</code>...")
+        res = subprocess.run(raw_text, shell=True, capture_output=True, text=True, cwd=WORKSPACE_DIR)
+        out = (res.stdout + "\n" + res.stderr).strip() or "(No output)"
+        result_msg = (
+            f"💻 <b>Command Output:</b>\n\n"
+            f"<pre>{out[-2800:]}</pre>"
         )
-        send_tg_message(chat_id, status_msg)
+        send_tg_message(chat_id, result_msg, reply_markup=get_main_menu_keyboard())
+        return
 
-    # 3. /run <filename>
-    elif cmd in ["/run", "/start_app"]:
-        filename = args[0] if args else config.get("auto_run_file", "bot.py")
-        success, msg = start_child_app(filename)
-        send_tg_message(chat_id, msg)
+    elif state == "WAITING_RUN_FILE":
+        user_states.pop(user_id, None)
+        filename = raw_text
+        if not filename.endswith(".py"):
+            filename += ".py"
+        ok, msg = start_child_app(filename)
+        send_tg_message(chat_id, msg, reply_markup=get_main_menu_keyboard())
+        return
 
-    # 4. /stop
-    elif cmd in ["/stop", "/stop_app"]:
-        success, msg = stop_child_app()
-        send_tg_message(chat_id, msg)
+    # Default Commands
+    if raw_text in ["/start", "/menu", "/help"]:
+        send_tg_message(chat_id, render_dashboard_text(), reply_markup=get_main_menu_keyboard())
+    
+    elif raw_text == "/status":
+        send_tg_message(chat_id, render_dashboard_text(), reply_markup=get_main_menu_keyboard())
+    
+    elif raw_text.startswith("/run"):
+        parts = raw_text.split()
+        if len(parts) > 1:
+            ok, msg = start_child_app(parts[1])
+            send_tg_message(chat_id, msg, reply_markup=get_main_menu_keyboard())
+        else:
+            # Show interactive run menu
+            prompt_run_menu(chat_id, user_id)
 
-    # 5. /restart
-    elif cmd == "/restart":
+    elif raw_text in ["/stop", "/stop_app"]:
+        ok, msg = stop_child_app()
+        send_tg_message(chat_id, msg, reply_markup=get_main_menu_keyboard())
+
+    elif raw_text in ["/restart"]:
         send_tg_message(chat_id, "🔄 Restarting application...")
-        success, msg = restart_child_app()
-        send_tg_message(chat_id, msg)
+        ok, msg = restart_child_app()
+        send_tg_message(chat_id, msg, reply_markup=get_main_menu_keyboard())
 
-    # 6. /logs
-    elif cmd == "/logs":
-        lines_count = int(args[0]) if args and args[0].isdigit() else 25
-        if not child_logs:
-            send_tg_message(chat_id, "ℹ️ No logs captured yet.")
+    elif raw_text.startswith("/logs"):
+        show_logs_view(chat_id)
+
+    elif raw_text == "/files":
+        show_files_view(chat_id)
+
+    elif raw_text.startswith("/pip"):
+        parts = raw_text.split()
+        if len(parts) > 1:
+            pkg = " ".join(parts[1:]).replace("install", "").strip()
+            send_tg_message(chat_id, f"⏳ Installing <code>{pkg}</code>...")
+            res = subprocess.run([sys.executable, "-m", "pip", "install", pkg], capture_output=True, text=True)
+            send_tg_message(chat_id, f"<pre>{res.stdout[-2500:]}</pre>", reply_markup=get_main_menu_keyboard())
         else:
-            selected_logs = "\n".join(child_logs[-lines_count:])
-            send_tg_message(chat_id, f"📋 <b>Last {min(lines_count, len(child_logs))} Log Lines:</b>\n<pre>{selected_logs}</pre>")
+            prompt_pip_menu(chat_id, user_id)
 
-    # 7. /files
-    elif cmd == "/files":
-        items = os.listdir(WORKSPACE_DIR)
-        file_list = []
-        for it in sorted(items):
-            if it.startswith(".git"):
-                continue
-            path = os.path.join(WORKSPACE_DIR, it)
-            if os.path.isdir(path):
-                file_list.append(f"📁 <b>{it}/</b>")
-            else:
-                sz = os.path.getsize(path)
-                file_list.append(f"📄 <code>{it}</code> ({sz} bytes)")
-        
-        msg = "📂 <b>Workspace Files:</b>\n" + ("\n".join(file_list) if file_list else "<i>Empty directory</i>")
-        send_tg_message(chat_id, msg)
+    elif raw_text.startswith("/sh") or raw_text.startswith("/exec"):
+        parts = raw_text.split()
+        if len(parts) > 1:
+            cmd = " ".join(parts[1:])
+            res = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=WORKSPACE_DIR)
+            out = (res.stdout + "\n" + res.stderr).strip() or "(No output)"
+            send_tg_message(chat_id, f"<pre>{out[-2800:]}</pre>", reply_markup=get_main_menu_keyboard())
+        else:
+            prompt_sh_menu(chat_id, user_id)
 
-    # 8. /download <filename>
-    elif cmd == "/download":
-        if not args:
-            send_tg_message(chat_id, "Usage: <code>/download filename.py</code>")
-            return
-        fname = args[0]
+    elif raw_text == "/sync":
+        send_tg_message(chat_id, "⏳ Syncing all files to GitHub...")
+        ok, msg = git_sync_to_github()
+        send_tg_message(chat_id, f"{'✅' if ok else '❌'} {msg}", reply_markup=get_main_menu_keyboard())
+
+    else:
+        # If user just types text, show dashboard
+        send_tg_message(chat_id, render_dashboard_text(), reply_markup=get_main_menu_keyboard())
+
+# ---------------------------------------------------------------------------
+# Interactive Submenus
+# ---------------------------------------------------------------------------
+def prompt_run_menu(chat_id, user_id, message_id=None):
+    py_files = [f for f in os.listdir(WORKSPACE_DIR) if f.endswith(".py") and f not in ["app.py"]]
+    
+    buttons = []
+    for py in py_files:
+        buttons.append([{"text": f"▶️ Run {py}", "callback_data": f"exec_run_{py}"}])
+    
+    buttons.append([{"text": "📤 Upload New Script", "callback_data": "menu_upload_prompt"}])
+    buttons.append([{"text": "🔙 Main Menu", "callback_data": "menu_main"}])
+    
+    text = (
+        "🚀 <b>Launch Python Script</b>\n\n"
+        "Choose an existing script from below, or simply <b>send your new .py file in chat</b> to deploy it!"
+    )
+    markup = {"inline_keyboard": buttons}
+    if message_id:
+        edit_tg_message(chat_id, message_id, text, reply_markup=markup)
+    else:
+        send_tg_message(chat_id, text, reply_markup=markup)
+
+def prompt_pip_menu(chat_id, user_id, message_id=None):
+    user_states[user_id] = "WAITING_PIP_PACKAGE"
+    text = (
+        "📦 <b>Install Python Package</b>\n\n"
+        "Please send the package name you want to install:\n"
+        "<i>(Example: <code>telethon</code>, <code>aiohttp</code>, <code>bs4</code>)</i>"
+    )
+    markup = {
+        "inline_keyboard": [
+            [{"text": "❌ Cancel", "callback_data": "menu_main"}]
+        ]
+    }
+    if message_id:
+        edit_tg_message(chat_id, message_id, text, reply_markup=markup)
+    else:
+        send_tg_message(chat_id, text, reply_markup=markup)
+
+def prompt_sh_menu(chat_id, user_id, message_id=None):
+    user_states[user_id] = "WAITING_SHELL_CMD"
+    text = (
+        "💻 <b>Linux Shell Terminal</b>\n\n"
+        "Please send the bash command you want to execute:\n"
+        "<i>(Example: <code>ls -la</code>, <code>df -h</code>, <code>python --version</code>)</i>"
+    )
+    markup = {
+        "inline_keyboard": [
+            [{"text": "❌ Cancel", "callback_data": "menu_main"}]
+        ]
+    }
+    if message_id:
+        edit_tg_message(chat_id, message_id, text, reply_markup=markup)
+    else:
+        send_tg_message(chat_id, text, reply_markup=markup)
+
+def show_logs_view(chat_id, message_id=None):
+    if not child_logs:
+        log_text = "<i>No logs recorded yet. Start a script to see live output.</i>"
+    else:
+        recent = "\n".join(child_logs[-25:])
+        log_text = f"<pre>{recent}</pre>"
+    
+    text = f"📋 <b>Live Execution Logs:</b>\n\n{log_text}"
+    markup = {
+        "inline_keyboard": [
+            [{"text": "🔄 Refresh Logs", "callback_data": "menu_logs"}],
+            [{"text": "🛑 Stop Script", "callback_data": "menu_stop"}, {"text": "🔄 Restart", "callback_data": "menu_restart"}],
+            [{"text": "🔙 Main Menu", "callback_data": "menu_main"}]
+        ]
+    }
+    if message_id:
+        edit_tg_message(chat_id, message_id, text, reply_markup=markup)
+    else:
+        send_tg_message(chat_id, text, reply_markup=markup)
+
+def show_files_view(chat_id, message_id=None):
+    items = sorted(os.listdir(WORKSPACE_DIR))
+    file_lines = []
+    download_buttons = []
+    
+    for it in items:
+        if it.startswith(".git") or it == "__pycache__":
+            continue
+        p = os.path.join(WORKSPACE_DIR, it)
+        if os.path.isfile(p):
+            sz = os.path.getsize(p)
+            file_lines.append(f"📄 <code>{it}</code> ({sz} bytes)")
+            download_buttons.append([
+                {"text": f"📥 {it}", "callback_data": f"file_dl_{it}"},
+                {"text": "🗑️ Delete", "callback_data": f"file_del_{it}"}
+            ])
+    
+    text = (
+        "📂 <b>Workspace Files Manager</b>\n\n"
+        + ("\n".join(file_lines) if file_lines else "<i>No files found</i>")
+        + "\n\n<i>Tap a file below to download or delete:</i>"
+    )
+    download_buttons.append([{"text": "🔙 Main Menu", "callback_data": "menu_main"}])
+    markup = {"inline_keyboard": download_buttons}
+    
+    if message_id:
+        edit_tg_message(chat_id, message_id, text, reply_markup=markup)
+    else:
+        send_tg_message(chat_id, text, reply_markup=markup)
+
+# ---------------------------------------------------------------------------
+# Callback Query Handler (Button Clicks)
+# ---------------------------------------------------------------------------
+def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
+    if user_id != config.get("admin_id") and config.get("admin_id") is not None:
+        answer_callback(callback_id, "⛔ Access Denied!", show_alert=True)
+        return
+
+    # 1. Main Menu
+    if data == "menu_main":
+        user_states.pop(user_id, None)
+        answer_callback(callback_id)
+        edit_tg_message(chat_id, message_id, render_dashboard_text(), reply_markup=get_main_menu_keyboard())
+
+    # 2. Status
+    elif data == "menu_status":
+        answer_callback(callback_id, "📊 Status Refreshed!")
+        edit_tg_message(chat_id, message_id, render_dashboard_text(), reply_markup=get_main_menu_keyboard())
+
+    # 3. Run Menu
+    elif data == "menu_run_select":
+        answer_callback(callback_id)
+        prompt_run_menu(chat_id, user_id, message_id)
+
+    # 4. Execute a specific file
+    elif data.startswith("exec_run_"):
+        fname = data.replace("exec_run_", "")
+        answer_callback(callback_id, f"Starting {fname}...")
+        ok, msg = start_child_app(fname)
+        send_tg_message(chat_id, msg, reply_markup=get_main_menu_keyboard())
+
+    # 5. Stop Script
+    elif data == "menu_stop":
+        ok, msg = stop_child_app()
+        answer_callback(callback_id, "Stopped!" if ok else "Not running")
+        send_tg_message(chat_id, msg, reply_markup=get_main_menu_keyboard())
+
+    # 6. Restart Script
+    elif data == "menu_restart":
+        answer_callback(callback_id, "Restarting...")
+        ok, msg = restart_child_app()
+        send_tg_message(chat_id, msg, reply_markup=get_main_menu_keyboard())
+
+    # 7. Logs
+    elif data == "menu_logs":
+        answer_callback(callback_id)
+        show_logs_view(chat_id, message_id)
+
+    # 8. Files
+    elif data == "menu_files":
+        answer_callback(callback_id)
+        show_files_view(chat_id, message_id)
+
+    # 9. Download File
+    elif data.startswith("file_dl_"):
+        fname = data.replace("file_dl_", "")
         fpath = os.path.join(WORKSPACE_DIR, fname)
-        if os.path.exists(fpath) and os.path.isfile(fpath):
-            send_tg_document(chat_id, fpath, caption=f"📄 {fname}")
+        if os.path.exists(fpath):
+            answer_callback(callback_id, f"Sending {fname}...")
+            send_tg_document(chat_id, fpath, caption=f"📄 <b>{fname}</b>")
         else:
-            send_tg_message(chat_id, f"❌ File <code>{fname}</code> does not exist.")
+            answer_callback(callback_id, "File not found!", show_alert=True)
 
-    # 9. /delete <filename>
-    elif cmd == "/delete":
-        if not args:
-            send_tg_message(chat_id, "Usage: <code>/delete filename.py</code>")
-            return
-        fname = args[0]
+    # 10. Delete File
+    elif data.startswith("file_del_"):
+        fname = data.replace("file_del_", "")
         fpath = os.path.join(WORKSPACE_DIR, fname)
         if os.path.exists(fpath):
             os.remove(fpath)
-            git_sync_to_github(f"Delete {fname} via Telegram")
-            send_tg_message(chat_id, f"🗑️ Deleted <code>{fname}</code> and synced to GitHub.")
+            git_sync_to_github(f"Deleted {fname} via Telegram")
+            answer_callback(callback_id, f"{fname} deleted!", show_alert=True)
+            show_files_view(chat_id, message_id)
         else:
-            send_tg_message(chat_id, f"❌ File <code>{fname}</code> not found.")
+            answer_callback(callback_id, "File not found!", show_alert=True)
 
-    # 10. /pip <package>
-    elif cmd == "/pip":
-        if not args:
-            send_tg_message(chat_id, "Usage: <code>/pip install pyTelegramBotAPI</code>")
-            return
-        pip_cmd = [sys.executable, "-m", "pip"] + args
-        send_tg_message(chat_id, f"⏳ Running: <code>pip {' '.join(args)}</code>...")
-        res = subprocess.run(pip_cmd, capture_output=True, text=True)
-        out = (res.stdout + "\n" + res.stderr).strip()
-        send_tg_message(chat_id, f"<pre>{out[-3000:]}</pre>")
+    # 11. Pip prompt
+    elif data == "menu_pip_prompt":
+        answer_callback(callback_id)
+        prompt_pip_menu(chat_id, user_id, message_id)
 
-    # 11. /sh <command>
-    elif cmd in ["/sh", "/exec"]:
-        if not args:
-            send_tg_message(chat_id, "Usage: <code>/sh ls -la</code>")
-            return
-        raw_cmd = " ".join(args)
-        send_tg_message(chat_id, f"⚡ Executing: <code>{raw_cmd}</code>...")
-        res = subprocess.run(raw_cmd, shell=True, capture_output=True, text=True, cwd=WORKSPACE_DIR)
-        out = (res.stdout + "\n" + res.stderr).strip() or "<i>(No output)</i>"
-        send_tg_message(chat_id, f"<pre>{out[-3000:]}</pre>")
+    # 12. Shell prompt
+    elif data == "menu_sh_prompt":
+        answer_callback(callback_id)
+        prompt_sh_menu(chat_id, user_id, message_id)
 
-    # 12. /sync
-    elif cmd == "/sync":
-        send_tg_message(chat_id, "⏳ Syncing all changes to GitHub repository...")
+    # 13. Sync
+    elif data == "menu_sync":
+        answer_callback(callback_id, "Syncing to GitHub...")
         ok, msg = git_sync_to_github()
-        send_tg_message(chat_id, f"{'✅' if ok else '❌'} {msg}")
+        send_tg_message(chat_id, f"{'✅' if ok else '❌'} {msg}", reply_markup=get_main_menu_keyboard())
 
-    # 13. /stats
-    elif cmd == "/stats":
-        ram = psutil.virtual_memory()
-        cpu = psutil.cpu_percent(interval=1)
-        disk = psutil.disk_usage('/')
-        stats_text = (
-            "💻 <b>System Statistics</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"• <b>CPU Usage:</b> {cpu}%\n"
-            f"• <b>RAM:</b> {ram.percent}% ({ram.used // (1024*1024)}MB / {ram.total // (1024*1024)}MB)\n"
-            f"• <b>Disk:</b> {disk.percent}% ({disk.used // (1024*1024*1024)}GB / {disk.total // (1024*1024*1024)}GB)\n"
-            f"• <b>Python Version:</b> {sys.version.split()[0]}"
+    # 14. Upload Prompt
+    elif data == "menu_upload_prompt":
+        user_states[user_id] = "WAITING_RUN_FILE"
+        answer_callback(callback_id)
+        text = (
+            "📤 <b>Upload New Python Script</b>\n\n"
+            "Abhi chat me apni <code>.py</code> file bhej dein.\n"
+            "Bot usko receive karke turant deploy karne ka option dega!"
         )
-        send_tg_message(chat_id, stats_text)
+        edit_tg_message(chat_id, message_id, text, reply_markup=get_back_keyboard())
 
-    else:
-        send_tg_message(chat_id, f"❓ Unknown command <code>{cmd}</code>. Type <code>/help</code> for available commands.")
-
-def handle_document(chat_id, user_id, doc):
+# ---------------------------------------------------------------------------
+# Document & File Upload Handler
+# ---------------------------------------------------------------------------
+def handle_document_upload(chat_id, user_id, doc):
     if user_id != config.get("admin_id") and config.get("admin_id") is not None:
-        send_tg_message(chat_id, "⛔ Unauthorized.")
+        send_tg_message(chat_id, "⛔ Access Denied.")
         return
     
     file_id = doc.get("file_id")
     file_name = doc.get("file_name", f"file_{int(time.time())}")
     dest_path = os.path.join(WORKSPACE_DIR, file_name)
     
-    send_tg_message(chat_id, f"📥 Receiving <code>{file_name}</code>...")
+    send_tg_message(chat_id, f"📥 <b>Receiving {file_name}...</b>")
     ok, err = download_tg_file(file_id, dest_path)
     
     if not ok:
@@ -466,19 +689,31 @@ def handle_document(chat_id, user_id, doc):
     
     # If requirements.txt, auto install
     if file_name == "requirements.txt":
-        send_tg_message(chat_id, "📦 <code>requirements.txt</code> detected! Auto-installing dependencies...")
+        send_tg_message(chat_id, "📦 <b>requirements.txt detected!</b>\nInstalling dependencies...")
         res = subprocess.run([sys.executable, "-m", "pip", "install", "-r", dest_path], capture_output=True, text=True)
-        send_tg_message(chat_id, f"✅ Dependencies installed:\n<pre>{res.stdout[-2000:]}</pre>")
+        send_tg_message(chat_id, f"✅ <b>Dependencies Installed:</b>\n<pre>{res.stdout[-2000:]}</pre>", reply_markup=get_main_menu_keyboard())
+    
     elif file_name.endswith(".py"):
-        send_tg_message(chat_id, f"✅ <b>{file_name}</b> saved and synced to GitHub!\n\nTo run it now, send:\n<code>/run {file_name}</code>")
+        text = (
+            f"✨ <b>{file_name} successfully uploaded!</b>\n\n"
+            "File workspace me save ho gayi hai aur GitHub par backup ho chuki hai.\n"
+            "Kya aap isko abhi start karna chahte hain?"
+        )
+        markup = {
+            "inline_keyboard": [
+                [{"text": f"▶️ Run {file_name} Now", "callback_data": f"exec_run_{file_name}"}],
+                [{"text": "🔙 Main Menu", "callback_data": "menu_main"}]
+            ]
+        }
+        send_tg_message(chat_id, text, reply_markup=markup)
     else:
-        send_tg_message(chat_id, f"✅ Saved <code>{file_name}</code> to workspace and synced to GitHub.")
+        send_tg_message(chat_id, f"✅ Saved <code>{file_name}</code> to workspace.", reply_markup=get_main_menu_keyboard())
 
 # ---------------------------------------------------------------------------
-# Telegram Long-Polling Worker
+# Polling Engine
 # ---------------------------------------------------------------------------
 def telegram_polling_loop():
-    logger.info("🤖 Telegram Polling loop started...")
+    logger.info("🤖 Telegram Polling Engine active...")
     offset = 0
     
     while IS_RUNNING:
@@ -491,23 +726,33 @@ def telegram_polling_loop():
                 if data.get("ok"):
                     for update in data.get("result", []):
                         offset = update["update_id"] + 1
-                        msg = update.get("message", {})
-                        chat_id = msg.get("chat", {}).get("id")
-                        user_id = msg.get("from", {}).get("id")
                         
-                        if not chat_id or not user_id:
-                            continue
+                        # Handle Callback Queries (Button Clicks)
+                        if "callback_query" in update:
+                            cq = update["callback_query"]
+                            cb_id = cq["id"]
+                            c_user = cq["from"]["id"]
+                            c_chat = cq["message"]["chat"]["id"]
+                            c_msg_id = cq["message"]["message_id"]
+                            c_data = cq.get("data", "")
+                            handle_callback_query(cb_id, c_chat, c_user, c_msg_id, c_data)
                         
-                        # Handle text message
-                        if "text" in msg:
-                            handle_command(chat_id, user_id, msg["text"])
-                        
-                        # Handle uploaded document / script
-                        elif "document" in msg:
-                            handle_document(chat_id, user_id, msg["document"])
-            time.sleep(1)
+                        # Handle Normal Messages
+                        elif "message" in update:
+                            msg = update["message"]
+                            chat_id = msg.get("chat", {}).get("id")
+                            user_id = msg.get("from", {}).get("id")
+                            
+                            if not chat_id or not user_id:
+                                continue
+                            
+                            if "text" in msg:
+                                handle_text_message(chat_id, user_id, msg["text"])
+                            elif "document" in msg:
+                                handle_document_upload(chat_id, user_id, msg["document"])
+            time.sleep(0.5)
         except Exception as e:
-            logger.error(f"Error in TG polling loop: {e}")
+            logger.error(f"Telegram polling error: {e}")
             time.sleep(3)
 
 # ---------------------------------------------------------------------------
@@ -515,34 +760,24 @@ def telegram_polling_loop():
 # ---------------------------------------------------------------------------
 def main():
     logger.info("=" * 60)
-    logger.info(f"🚀 Telegram Relay Server Controller Initialized [Run #{RUN_ID}]")
+    logger.info(f"🚀 Telegram Relay Controller Initialized [Run #{RUN_ID}]")
     logger.info("=" * 60)
     
-    # Notify Admin if admin_id is already known
-    if config.get("admin_id"):
-        send_tg_message(
-            config["admin_id"],
-            f"🟢 <b>Relay Runner #{RUN_ID} is LIVE!</b>\n"
-            f"GitHub Runner environment ready. Type <code>/status</code> or <code>/help</code> to manage."
-        )
-    
-    # Auto-start previously configured script if it exists
+    # Auto-start previously running script if present
     auto_file = config.get("auto_run_file", "bot.py")
     if os.path.exists(os.path.join(WORKSPACE_DIR, auto_file)):
         logger.info(f"Auto-starting {auto_file}...")
         start_child_app(auto_file)
-        if config.get("admin_id"):
-            send_tg_message(config["admin_id"], f"🚀 Auto-started <code>{auto_file}</code>.")
 
     # Start Telegram polling thread
     tg_thread = threading.Thread(target=telegram_polling_loop, daemon=True, name="TGPolling")
     tg_thread.start()
     
-    # Main duration watcher loop (5.5 hours)
+    # Watchdog loop for 5.5 hours duration
     while IS_RUNNING:
         elapsed = time.time() - START_TIME
         if elapsed >= RUN_DURATION_SECONDS:
-            logger.info(f"⏳ 5.5 Hours reached ({RUN_DURATION_SECONDS}s). Performing Handoff...")
+            logger.info(f"⏳ 5.5 Hours reached. Triggering Handoff...")
             break
         time.sleep(5)
     
@@ -551,24 +786,14 @@ def main():
         send_tg_message(
             config["admin_id"],
             "🔄 <b>5.5 Hours Relay Limit Reached:</b>\n"
-            "Backing up files to GitHub and launching next runner..."
+            "Backing up workspace and transitioning to next runner..."
         )
     
-    # 1. Stop child process
     stop_child_app()
-    
-    # 2. Sync all local files & state to GitHub
     git_sync_to_github("Auto-backup before Relay Handoff")
-    
-    # 3. Trigger next runner via GitHub Actions API
-    logger.info("Triggering successor workflow via API...")
     trigger_next_runner()
-    
-    # 4. Safety buffer
-    logger.info("Holding safety window (15s)...")
     time.sleep(15)
-    
-    logger.info("Handoff sequence complete. Exiting current runner.")
+    logger.info("Handoff sequence complete. Exiting.")
 
 if __name__ == "__main__":
     main()
