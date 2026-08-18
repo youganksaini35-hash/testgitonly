@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import json
+import html
 import psutil
 import logging
 import signal
@@ -107,8 +108,12 @@ def send_tg_message(chat_id, text, reply_markup=None, parse_mode="HTML"):
         payload["reply_markup"] = reply_markup
     
     try:
-        resp = requests.post(url, json=payload, timeout=10)
-        return resp.json()
+        resp = requests.post(url, json=payload, timeout=10).json()
+        if not resp.get("ok"):
+            # Fallback without parse_mode in case of HTML entity error
+            payload.pop("parse_mode", None)
+            return requests.post(url, json=payload, timeout=10).json()
+        return resp
     except Exception as e:
         logger.error(f"Failed to send Telegram message: {e}")
         return None
@@ -124,9 +129,18 @@ def edit_tg_message(chat_id, message_id, text, reply_markup=None, parse_mode="HT
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:
-        requests.post(url, json=payload, timeout=10)
+        resp = requests.post(url, json=payload, timeout=10).json()
+        if not resp.get("ok"):
+            err_desc = resp.get("description", "")
+            if "message is not modified" in err_desc:
+                return resp
+            # Fallback without parse_mode in case of HTML entity parsing issue
+            payload.pop("parse_mode", None)
+            return requests.post(url, json=payload, timeout=10).json()
+        return resp
     except Exception as e:
         logger.error(f"Failed to edit message: {e}")
+        return None
 
 def answer_callback(callback_query_id, text=None, show_alert=False):
     url = f"{TG_BASE_URL}/answerCallbackQuery"
@@ -685,13 +699,23 @@ def prompt_sh_menu(chat_id, user_id, message_id=None):
         send_tg_message(chat_id, text, reply_markup=markup)
 
 def show_logs_view(chat_id, message_id=None):
+    is_alive = child_process and child_process.poll() is None
+    status_header = f"🟢 <code>{child_process_name}</code> (Running)" if is_alive else f"🔴 <code>{child_process_name or 'None'}</code> (Stopped)"
+    
     if not child_logs:
         log_text = "<i>No logs recorded yet. Start a script to see live output.</i>"
     else:
-        recent = "\n".join(child_logs[-25:])
-        log_text = f"<pre>{recent}</pre>"
+        recent = "\n".join(child_logs[-30:])
+        escaped_recent = html.escape(recent)
+        log_text = f"<pre>{escaped_recent}</pre>"
     
-    text = f"📋 <b>Live Execution Logs:</b>\n\n{log_text}"
+    text = (
+        "📋 <b>Live Execution Logs</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"• <b>Status:</b> {status_header}\n"
+        f"• <b>Total Logs in Buffer:</b> {len(child_logs)} lines\n\n"
+        f"{log_text}"
+    )
     markup = {
         "inline_keyboard": [
             [{"text": "🔄 Refresh Logs", "callback_data": "menu_logs"}],
