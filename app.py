@@ -193,8 +193,47 @@ def log_stream_reader(pipe):
     except Exception:
         pass
 
-def start_child_app(filename="bot.py"):
+def child_watchdog(proc, fname):
+    """Watches the running child process and sends alert if it exits or crashes."""
+    ret = proc.wait()
     global child_process, child_process_name, child_process_start_time
+    
+    # Only act if this is still the registered active process
+    if child_process == proc:
+        child_process = None
+        child_process_name = None
+        child_process_start_time = None
+        
+        recent_err = "\n".join(child_logs[-15:]) if child_logs else "(No output recorded)"
+        admin_id = config.get("admin_id")
+        
+        if admin_id:
+            if ret != 0:
+                alert_text = (
+                    f"⚠️ <b>Script Crashed / Exited!</b>\n"
+                    f"📁 <b>File:</b> <code>{fname}</code>\n"
+                    f"🔴 <b>Exit Code:</b> <code>{ret}</code>\n\n"
+                    f"<b>Error Traceback:</b>\n"
+                    f"<pre>{recent_err[-3000:]}</pre>\n\n"
+                    f"💡 <i>Tip: Agar koi module missing hai toh package install karein.</i>"
+                )
+                markup = {
+                    "inline_keyboard": [
+                        [{"text": "📦 Install Missing Package", "callback_data": "menu_pip_prompt"}],
+                        [{"text": "🔄 Try Restarting", "callback_data": f"exec_run_{fname}"}],
+                        [{"text": "🔙 Main Menu", "callback_data": "menu_main"}]
+                    ]
+                }
+            else:
+                alert_text = (
+                    f"ℹ️ <b>Script Completed:</b> <code>{fname}</code> exited normally (Code 0).\n\n"
+                    f"<b>Output:</b>\n<pre>{recent_err[-2000:]}</pre>"
+                )
+                markup = get_main_menu_keyboard()
+            send_tg_message(admin_id, alert_text, reply_markup=markup)
+
+def start_child_app(filename="bot.py"):
+    global child_process, child_process_name, child_process_start_time, child_logs
     
     if not os.path.exists(filename):
         return False, f"File <b>{filename}</b> workspace me nahi mili."
@@ -203,24 +242,47 @@ def start_child_app(filename="bot.py"):
         stop_child_app()
     
     try:
+        child_logs = []
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        
         cmd = [sys.executable, "-u", filename]
-        child_process = subprocess.Popen(
+        proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             text=True,
             bufsize=1,
-            cwd=WORKSPACE_DIR
+            cwd=WORKSPACE_DIR,
+            env=env
         )
+        child_process = proc
         child_process_name = filename
         child_process_start_time = time.time()
         
         config["auto_run_file"] = filename
         save_config(config)
         
-        threading.Thread(target=log_stream_reader, args=(child_process.stdout,), daemon=True).start()
-        return True, f"✨ <b>{filename}</b> successfully start ho gaya!\n🆔 Process ID: <code>{child_process.pid}</code>"
+        threading.Thread(target=log_stream_reader, args=(proc.stdout,), daemon=True).start()
+        threading.Thread(target=child_watchdog, args=(proc, filename), daemon=True).start()
+        
+        # Initial health check (wait 1.5s to verify process stays alive)
+        time.sleep(1.5)
+        
+        poll_res = proc.poll()
+        if poll_res is not None:
+            err_msg = "\n".join(child_logs) if child_logs else "(No output recorded)"
+            child_process = None
+            child_process_name = None
+            child_process_start_time = None
+            return False, (
+                f"❌ <b>{filename} fail ho gaya (Exit Code: {poll_res})</b>\n\n"
+                f"<b>Error Details:</b>\n<pre>{err_msg[-2500:]}</pre>\n\n"
+                f"💡 <i>Tip: Missing package hone par <b>Install Pip Package</b> use karein.</i>"
+            )
+        
+        return True, f"✨ <b>{filename}</b> is running 24/7!\n🆔 Process ID: <code>{proc.pid}</code>\n🟢 State: Active"
     except Exception as e:
         return False, f"❌ Start error: {e}"
 
