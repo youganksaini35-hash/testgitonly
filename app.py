@@ -202,8 +202,11 @@ def git_sync_to_github(commit_message="Update via Telegram Controller"):
         subprocess.run(["git", "commit", "-m", commit_message], check=True)
         push_res = subprocess.run(["git", "push", remote_url, "main"], capture_output=True, text=True)
         if push_res.returncode == 0:
-            return True, "Successfully synced to GitHub!"
-        return False, push_res.stderr
+            logger.info("Auto-sync to cloud complete.")
+            return True, "Cloud sync complete! All changes backed up."
+        else:
+            logger.error(f"Git push error: {push_res.stderr}")
+            return False, f"Cloud Sync error: {push_res.stderr[-200:]}"
     except Exception as e:
         return False, str(e)
 
@@ -556,6 +559,7 @@ def render_dashboard_text():
     uptime_sec = int(time.time() - START_TIME)
     hours, remainder = divmod(uptime_sec, 3600)
     minutes, seconds = divmod(remainder, 60)
+    uptime_str = f"{hours}h {minutes}m {seconds}s"
     
     is_alive = child_process and child_process.poll() is None
     child_status = "🟢 Active (Running)" if is_alive else "🔴 Inactive (Stopped)"
@@ -570,11 +574,11 @@ def render_dashboard_text():
     ram = psutil.virtual_memory()
     cpu = psutil.cpu_percent(interval=None)
 
-    text = (
-        "⚡ <b>24/7 Cloud Relay Control Panel</b>\n"
+    status_text = (
+        f"⚡ <b>Cloud Server Dashboard</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🖥️ <b>Server Host:</b> GitHub Actions (Ubuntu)\n"
-        f"⏱️ <b>Runner Uptime:</b> {hours}h {minutes}m {seconds}s\n"
+        f"🖥️ <b>Server Host:</b> High-Speed Cloud Server (Linux)\n"
+        f"⏱️ <b>Server Uptime:</b> {uptime_str}\n"
         f"⚙️ <b>Active Script:</b> <code>{child_process_name or 'None'}</code>\n"
         f"📊 <b>Script State:</b> {child_status}\n"
         f"⏳ <b>Script Uptime:</b> {child_uptime_str}\n"
@@ -583,7 +587,7 @@ def render_dashboard_text():
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "💡 <i>Aap koi bhi .py file ya requirements.txt direct chat me bhej sakte hain!</i>"
     )
-    return text
+    return status_text
 
 # ---------------------------------------------------------------------------
 # Message & Interactive Step Handler
@@ -650,7 +654,7 @@ def handle_text_message(chat_id, user_id, text):
                 f"✅ <b>Variable Saved for <code>{target_py}</code>!</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"• 🔑 <code>{key}</code> = <code>{masked}</code>\n\n"
-                f"📁 Saved to dedicated <code>scripts/{base_n}.env</code> and synced to GitHub!"
+                f"📁 Saved to dedicated <code>scripts/{base_n}.env</code> and backed up to Cloud!"
             )
             markup = {
                 "inline_keyboard": [
@@ -753,8 +757,8 @@ def handle_text_message(chat_id, user_id, text):
         admin_list_str = "\n".join([f"• <code>{x}</code>" for x in config.get("admin_ids", [])])
         send_tg_message(chat_id, f"👑 <b>Authorized Admins:</b>\n{admin_list_str}", reply_markup=get_main_menu_keyboard())
 
-    elif raw_text == "/sync":
-        send_tg_message(chat_id, "⏳ Syncing all files to GitHub...")
+    elif raw_text in ["/sync", "/backup"]:
+        send_tg_message(chat_id, "⏳ Syncing all files to Cloud Storage...")
         ok, msg = git_sync_to_github()
         send_tg_message(chat_id, f"{'✅' if ok else '❌'} {msg}", reply_markup=get_main_menu_keyboard())
 
@@ -925,7 +929,7 @@ def prompt_runner_menu(chat_id, user_id, message_id=None):
             "🚀 <b>Scripts Runner Manager</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             f"• <b>Active Process:</b> {'🟢 ' + child_process_name if is_alive else '🔴 None (Stopped)'}\n"
-            f"• <b>Total Scripts in GitHub:</b> {len(files)}\n\n"
+            f"• <b>Total Scripts Available:</b> {len(files)}\n\n"
             "<i>Neeche kisi bhi script par click karke use run karein:</i>"
         )
         for py in files:
@@ -1076,7 +1080,7 @@ def show_files_view(chat_id, message_id=None):
     text = (
         "📂 <b>Scripts File Manager</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📁 <b>Target Directory:</b> <code>scripts/</code> (GitHub Repository)\n"
+        f"📁 <b>Directory:</b> <code>scripts/</code> (Cloud Storage)\n"
         f"📊 <b>Total Files:</b> {len(files)}\n\n"
         + "\n".join(file_lines)
         + "\n\n<i>Tap a button below to Download, Run, or Delete:</i>"
@@ -1299,7 +1303,7 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
             f"⚠️ <b>Confirm File Deletion</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             f"Kya aap sach me <code>scripts/{fname}</code> ko <b>delete</b> karna chahte hain?\n\n"
-            "<i>Yeh file GitHub repo ke scripts/ folder se permanent delete ho jayegi.</i>"
+            "<i>Yeh file scripts/ folder se permanent delete ho jayegi.</i>"
         )
         markup = {
             "inline_keyboard": [
@@ -1337,7 +1341,7 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
 
     # 13. Sync
     elif data == "menu_sync":
-        answer_callback(callback_id, "Syncing to GitHub...")
+        answer_callback(callback_id, "Syncing to Cloud...")
         ok, msg = git_sync_to_github()
         send_tg_message(chat_id, f"{'✅' if ok else '❌'} {msg}", reply_markup=get_main_menu_keyboard())
 
@@ -1348,7 +1352,7 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
         text = (
             "📤 <b>Upload New Python Script</b>\n\n"
             "Abhi chat me apni <code>.py</code> file bhej dein.\n"
-            "Bot usko automatically GitHub ke <code>scripts/</code> folder me save karega!"
+            "Bot usko automatically <code>scripts/</code> folder me save karega!"
         )
         edit_tg_message(chat_id, message_id, text, reply_markup=get_back_keyboard())
 
@@ -1438,7 +1442,7 @@ def handle_document_upload(chat_id, user_id, doc):
         text = (
             f"✨ <b>Python Script Saved:</b> <code>scripts/{file_name}</code>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "📁 File GitHub repository ke <b>scripts/</b> folder me save ho chuki hai!\n\n"
+            "📁 File <b>scripts/</b> folder me save ho chuki hai!\n\n"
             "📦 <b>requirements.txt bhej sakte hain</b> taaki dependencies install ho sakein,\n"
             "ya neeche button se <b>Direct Run</b> ya <b>Scripts Runner</b> open kar sakte hain:"
         )
@@ -1461,7 +1465,7 @@ def handle_document_upload(chat_id, user_id, doc):
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             f"• <b>Linked Script:</b> <code>scripts/{target_py}</code>\n"
             f"• <b>Total Variables Loaded:</b> {count}\n\n"
-            f"📁 Saved and synced to GitHub repository."
+            f"📁 Saved and backed up to Cloud Storage."
         )
         markup = {
             "inline_keyboard": [
@@ -1475,7 +1479,7 @@ def handle_document_upload(chat_id, user_id, doc):
     else:
         send_tg_message(
             chat_id,
-            f"✅ <b>{file_name}</b> GitHub repository ke <code>scripts/</code> folder me save ho gayi hai.",
+            f"✅ <b>{file_name}</b> <code>scripts/</code> folder me save ho gayi hai.",
             reply_markup=get_main_menu_keyboard()
         )
 
