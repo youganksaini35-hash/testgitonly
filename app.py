@@ -327,6 +327,26 @@ def child_watchdog(proc, fname):
                 markup = get_main_menu_keyboard()
             notify_all_admins(alert_text, reply_markup=markup)
 
+installed_req_hashes = {}
+
+def check_and_install_reqs(req_path):
+    """Smart installer: only runs pip if the file hasn't been installed in this session or changed."""
+    if not req_path or not os.path.exists(req_path):
+        return
+    import hashlib
+    try:
+        with open(req_path, "rb") as f:
+            file_hash = hashlib.md5(f.read()).hexdigest()
+        if installed_req_hashes.get(req_path) == file_hash:
+            # Already installed in this runner session! Skip with 0ms delay!
+            return
+        
+        logger.info(f"Installing requirements from {os.path.basename(req_path)}...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "-r", req_path], capture_output=True, text=True)
+        installed_req_hashes[req_path] = file_hash
+    except Exception as e:
+        logger.error(f"Error checking requirements hash: {e}")
+
 def start_child_app(filename="bot.py"):
     global child_process, child_process_name, child_process_start_time, child_logs
     
@@ -341,11 +361,10 @@ def start_child_app(filename="bot.py"):
         else:
             return False, f"File <code>{base_filename}</code> scripts folder me nahi mili."
     
-    # Auto-install dedicated requirements if present
+    # Smart Auto-install: only if not already installed in current session
     req_path = get_script_req_path(base_filename)
     if req_path:
-        logger.info(f"Auto-installing requirements for {base_filename} from {os.path.basename(req_path)}...")
-        subprocess.run([sys.executable, "-m", "pip", "install", "-r", req_path], capture_output=True, text=True)
+        check_and_install_reqs(req_path)
 
     if child_process and child_process.poll() is None:
         stop_child_app()
