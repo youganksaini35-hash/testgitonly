@@ -1,183 +1,168 @@
 import os
 import sys
 import time
-import psutil
+import json
+import random
 import logging
+import signal
 import threading
+import uuid
 from datetime import datetime
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse
-import uvicorn
+import requests
 
 # ---------------------------------------------------------------------------
-# Logging Setup
+# Logging Configuration
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
-logger = logging.getLogger("HFRunner")
-
-recent_logs = []
-
-def log_event(message: str, level: str = "INFO"):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    entry = f"[{timestamp}] [{level}] {message}"
-    recent_logs.append(entry)
-    if len(recent_logs) > 50:
-        recent_logs.pop(0)
-    logger.info(message)
+logger = logging.getLogger("RelayRunner")
 
 # ---------------------------------------------------------------------------
-# Application State & Configuration
+# Environment Variables & Configuration
 # ---------------------------------------------------------------------------
+GH_PAT = os.environ.get("GH_PAT", "")
+GIST_ID = os.environ.get("GIST_ID", "")
+RUN_ID = os.environ.get("GITHUB_RUN_ID", str(uuid.uuid4())[:8])
+REPO = os.environ.get("GITHUB_REPOSITORY", "Saini920/testgitonly")
+WORKFLOW_FILE = os.environ.get("WORKFLOW_FILE", "server.yml")
+WORKFLOW_REF = os.environ.get("WORKFLOW_REF", "main")
+
+# Default run duration: 5.5 hours (330 minutes = 19800 seconds)
+RUN_DURATION_SECONDS = int(os.environ.get("RUN_DURATION_SECONDS", "19800"))
+LOCK_TTL_SECONDS = int(os.environ.get("LOCK_TTL_SECONDS", "180"))
+HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "30"))
+CHECKPOINT_INTERVAL = int(os.environ.get("CHECKPOINT_INTERVAL", "60"))
+
 START_TIME = time.time()
-PORT = int(os.environ.get("PORT", "7860"))
 IS_RUNNING = True
 
-state = {
+app_state = {
     "tasks_executed": 0,
-    "last_run_time": None,
-    "status": "Running 24/7",
-    "custom_data": {}
+    "last_checkpoint": 0,
+    "run_id": str(RUN_ID),
+    "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 }
 
 # ---------------------------------------------------------------------------
-# Background 24/7 Worker (Put Your Continuous Bot / Scraper / Tasks Here)
+# State Management (Gist or Memory/Local)
 # ---------------------------------------------------------------------------
-def continuous_background_worker():
-    """
-    Yeh background thread 24/7 continuous chalti rahegi bina kisi timeout ke.
-    Aap yahan apna Telegram Bot, Scraper, ya koi bhi Python code run kar sakte hain.
-    """
-    log_event("🚀 Background 24/7 Worker started successfully!")
+def get_gist_headers():
+    return {
+        "Authorization": f"Bearer {GH_PAT}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+
+def fetch_remote_state():
+    if not GH_PAT or not GIST_ID:
+        return {"schema_version": 1, "lock_owner": str(RUN_ID), "lock_expiry": int(time.time()) + 9999, "data": app_state}
     
+    url = f"https://api.github.com/gists/{GIST_ID}"
+    try:
+        resp = requests.get(url, headers=get_gist_headers(), timeout=10)
+        if resp.status_code == 200:
+            files = resp.json().get("files", {})
+            if "state.json" in files:
+                return json.loads(files["state.json"].get("content", "{}"))
+    except Exception as e:
+        logger.error(f"Gist fetch error: {e}")
+    return None
+
+def update_remote_state(state_dict):
+    if not GH_PAT or not GIST_ID:
+        return True
+    url = f"https://api.github.com/gists/{GIST_ID}"
+    payload = {"files": {"state.json": {"content": json.dumps(state_dict, indent=2)}}}
+    try:
+        resp = requests.patch(url, headers=get_gist_headers(), json=payload, timeout=10)
+        return resp.status_code == 200
+    except Exception as e:
+        logger.error(f"Gist update error: {e}")
+        return False
+
+# ---------------------------------------------------------------------------
+# Self-Trigger: Next Runner Launch via GitHub REST API
+# ---------------------------------------------------------------------------
+def trigger_next_runner():
+    """Dispatches the next GitHub Actions workflow run before timeout."""
+    token = GH_PAT or os.environ.get("GITHUB_TOKEN", "")
+    if not token or not REPO:
+        logger.warning("No token or repository set for self-trigger.")
+        return False
+    
+    url = f"https://api.github.com/repos/{REPO}/actions/workflows/{WORKFLOW_FILE}/dispatches"
+    payload = {"ref": WORKFLOW_REF}
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    
+    logger.info(f"🚀 Triggering next workflow: {url} on branch '{WORKFLOW_REF}'...")
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        if resp.status_code == 204:
+            logger.info("✅ Next workflow dispatched successfully!")
+            return True
+        else:
+            logger.error(f"Failed to dispatch workflow (status {resp.status_code}): {resp.text}")
+    except Exception as e:
+        logger.error(f"Error dispatching workflow: {e}")
+    return False
+
+# ---------------------------------------------------------------------------
+# Continuous Background Worker (Your Actual Bot/Tasks)
+# ---------------------------------------------------------------------------
+def background_worker():
+    """Continuous 24/7 background task loop."""
+    logger.info("⚡ Background task worker active.")
     while IS_RUNNING:
         try:
-            # ---------------------------------------------------------------
-            # 💡 TUMHARA CUSTOM CODE YAHAN AAYEGA:
-            # e.g., Telegram polling, API scraping, Database sync, etc.
-            # ---------------------------------------------------------------
-            state["tasks_executed"] += 1
-            state["last_run_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            app_state["tasks_executed"] += 1
+            uptime_sec = int(time.time() - START_TIME)
+            hours, remainder = divmod(uptime_sec, 3600)
+            minutes, seconds = divmod(remainder, 60)
             
-            log_event(f"Task cycle #{state['tasks_executed']} executed successfully.")
+            logger.info(f"🟢 [Task Cycle #{app_state['tasks_executed']}] Runner Uptime: {hours}h {minutes}m {seconds}s | Status: Normal")
             
-            # Har 30 second me ek task cycle run hoga (apne hisaab se change karein)
+            # Put your actual Python code (Telegram bot, scraper, etc.) here
             time.sleep(30)
             
         except Exception as e:
-            log_event(f"Error in background task: {e}", level="ERROR")
+            logger.error(f"Error in task cycle: {e}")
             time.sleep(5)
 
 # ---------------------------------------------------------------------------
-# Web Dashboard & API (FastAPI)
+# Main Orchestrator
 # ---------------------------------------------------------------------------
-app = FastAPI(title="24/7 Python Runner on Hugging Face")
-
-@app.get("/", response_class=HTMLResponse)
-async def web_dashboard():
-    uptime_sec = int(time.time() - START_TIME)
-    hours, remainder = divmod(uptime_sec, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    uptime_str = f"{hours}h {minutes}m {seconds}s"
+def main():
+    logger.info("=" * 60)
+    logger.info(f"🚀 GitHub Actions Relay Runner Started [Run ID: {RUN_ID}]")
+    logger.info(f"Target Duration: {RUN_DURATION_SECONDS}s ({RUN_DURATION_SECONDS/60:.1f} minutes)")
+    logger.info("=" * 60)
     
-    ram = psutil.virtual_memory()
-    cpu = psutil.cpu_percent(interval=None)
-    
-    logs_html = "".join([f"<div class='log-line'>{line}</div>" for line in reversed(recent_logs[-15:])])
-    
-    html = f"""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>24/7 Python Runner Dashboard</title>
-        <style>
-            * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }}
-            body {{ background-color: #0f172a; color: #f8fafc; padding: 24px; min-height: 100vh; }}
-            .container {{ max-width: 900px; margin: 0 auto; }}
-            .header {{ display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; border-bottom: 1px solid #1e293b; padding-bottom: 16px; }}
-            .badge {{ display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; background: rgba(34, 197, 94, 0.15); color: #4ade80; border-radius: 9999px; font-weight: 600; font-size: 14px; border: 1px solid rgba(34, 197, 94, 0.3); }}
-            .badge-dot {{ width: 8px; height: 8px; background: #22c55e; border-radius: 50%; animation: pulse 2s infinite; }}
-            @keyframes pulse {{ 0% {{ opacity: 1; }} 50% {{ opacity: 0.4; }} 100% {{ opacity: 1; }} }}
-            .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }}
-            .card {{ background: #1e293b; border-radius: 12px; padding: 20px; border: 1px solid #334155; }}
-            .card-title {{ font-size: 13px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }}
-            .card-val {{ font-size: 26px; font-weight: 700; color: #f1f5f9; }}
-            .logs-container {{ background: #0b1120; border-radius: 12px; padding: 20px; border: 1px solid #1e293b; font-family: monospace; font-size: 13px; max-height: 320px; overflow-y: auto; }}
-            .log-line {{ padding: 4px 0; color: #cbd5e1; border-bottom: 1px solid #1e293b; }}
-            .log-line:first-child {{ color: #38bdf8; font-weight: 600; }}
-            .footer {{ margin-top: 24px; text-align: center; color: #64748b; font-size: 13px; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="header">
-                <div>
-                    <h1 style="font-size: 22px;">⚡ Hugging Face 24/7 Background Runner</h1>
-                    <p style="color: #94a3b8; font-size: 14px; margin-top: 4px;">Always-on Python execution with free HTTPS endpoint</p>
-                </div>
-                <div class="badge">
-                    <span class="badge-dot"></span> ALWAYS ON
-                </div>
-            </div>
-
-            <div class="grid">
-                <div class="card">
-                    <div class="card-title">Server Uptime</div>
-                    <div class="card-val">{uptime_str}</div>
-                </div>
-                <div class="card">
-                    <div class="card-title">Tasks Cycles</div>
-                    <div class="card-val">{state['tasks_executed']}</div>
-                </div>
-                <div class="card">
-                    <div class="card-title">RAM Usage (16GB)</div>
-                    <div class="card-val">{ram.percent}%</div>
-                </div>
-                <div class="card">
-                    <div class="card-title">CPU Load</div>
-                    <div class="card-val">{cpu}%</div>
-                </div>
-            </div>
-
-            <h2 style="font-size: 16px; margin-bottom: 12px; color: #cbd5e1;">Live Execution Logs</h2>
-            <div class="logs-container">
-                {logs_html}
-            </div>
-
-            <div class="footer">
-                Powered by Hugging Face Spaces • Python 3.10 • Port {PORT}
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-    return html
-
-@app.get("/health")
-async def health_check():
-    return {
-        "status": "healthy",
-        "uptime_seconds": int(time.time() - START_TIME),
-        "tasks_executed": state["tasks_executed"]
-    }
-
-@app.get("/api/state")
-async def get_state():
-    return JSONResponse(content=state)
-
-# ---------------------------------------------------------------------------
-# Main Entry Point
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    # Start background worker thread
-    worker_thread = threading.Thread(target=continuous_background_worker, daemon=True, name="BackgroundWorker")
+    # Start background task thread
+    worker_thread = threading.Thread(target=background_worker, daemon=True, name="WorkerThread")
     worker_thread.start()
     
-    # Start Web Server on 0.0.0.0:7860
-    logger.info(f"Starting server on port {PORT}...")
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")
+    # Main execution timer loop
+    while IS_RUNNING:
+        elapsed = time.time() - START_TIME
+        if elapsed >= RUN_DURATION_SECONDS:
+            logger.info(f"⏳ Time limit reached ({RUN_DURATION_SECONDS}s). Preparing graceful handoff...")
+            break
+        time.sleep(5)
+    
+    # Handoff to next runner
+    logger.info("🔄 Initiating successor runner handoff...")
+    trigger_next_runner()
+    
+    logger.info("Holding safety buffer (15s) for next runner queue...")
+    time.sleep(15)
+    logger.info("🎉 Runner finished successfully. Exiting.")
+
+if __name__ == "__main__":
+    main()
