@@ -6,6 +6,11 @@ on:
     # Fallback cron trigger (every 30 minutes to restart if runner terminates)
     - cron: '*/30 * * * *'
 
+# Ensure ONLY ONE active runner at all times (auto-kills stale runners)
+concurrency:
+  group: relay-runner-singleton
+  cancel-in-progress: true
+
 permissions: write-all
 
 jobs:
