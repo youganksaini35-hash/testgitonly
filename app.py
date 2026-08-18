@@ -956,6 +956,7 @@ def telegram_polling_loop():
 # Main Orchestrator & Auto-Runner
 # ---------------------------------------------------------------------------
 def main():
+    global IS_RUNNING
     logger.info("=" * 60)
     logger.info(f"🚀 Telegram Relay Controller Initialized [Run #{RUN_ID}]")
     logger.info("=" * 60)
@@ -979,7 +980,6 @@ def main():
         time.sleep(5)
     
     # --- HANDOFF SEQUENCE ---
-    global IS_RUNNING
     IS_RUNNING = False # Stop Telegram polling immediately on old runner
     
     notify_all_admins(
