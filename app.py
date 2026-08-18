@@ -38,6 +38,8 @@ IS_RUNNING = True
 
 # Workspace & Config
 WORKSPACE_DIR = os.getcwd()
+SCRIPTS_DIR = os.path.join(WORKSPACE_DIR, "scripts")
+os.makedirs(SCRIPTS_DIR, exist_ok=True)
 CONFIG_FILE = os.path.join(WORKSPACE_DIR, "bot_config.json")
 
 # State & Processes
@@ -255,8 +257,13 @@ def child_watchdog(proc, fname):
 def start_child_app(filename="bot.py"):
     global child_process, child_process_name, child_process_start_time, child_logs
     
-    if not os.path.exists(filename):
-        return False, f"File <b>{filename}</b> workspace me nahi mili."
+    # Check in scripts/ directory first, then root workspace
+    if os.path.exists(os.path.join(SCRIPTS_DIR, filename)):
+        full_path = os.path.join(SCRIPTS_DIR, filename)
+    elif os.path.exists(os.path.join(WORKSPACE_DIR, filename)):
+        full_path = os.path.join(WORKSPACE_DIR, filename)
+    else:
+        return False, f"File <code>{filename}</code> scripts folder me nahi mili."
     
     if child_process and child_process.poll() is None:
         stop_child_app()
@@ -265,8 +272,9 @@ def start_child_app(filename="bot.py"):
         child_logs = []
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        env.update(config.get("env_vars", {}))
         
-        cmd = [sys.executable, "-u", filename]
+        cmd = [sys.executable, "-u", full_path]
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -280,9 +288,6 @@ def start_child_app(filename="bot.py"):
         child_process = proc
         child_process_name = filename
         child_process_start_time = time.time()
-        
-        config["auto_run_file"] = filename
-        save_config(config)
         
         threading.Thread(target=log_stream_reader, args=(proc.stdout,), daemon=True).start()
         threading.Thread(target=child_watchdog, args=(proc, filename), daemon=True).start()
@@ -302,7 +307,7 @@ def start_child_app(filename="bot.py"):
                 f"💡 <i>Tip: Missing package hone par <b>Install Pip Package</b> use karein.</i>"
             )
         
-        return True, f"✨ <b>{filename}</b> is running 24/7!\n🆔 Process ID: <code>{proc.pid}</code>\n🟢 State: Active"
+        return True, f"✨ <b>{filename}</b> started successfully!\n🆔 Process ID: <code>{proc.pid}</code>\n🟢 State: Active (Running)"
     except Exception as e:
         return False, f"❌ Start error: {e}"
 
@@ -381,16 +386,27 @@ def trigger_next_runner():
 # ---------------------------------------------------------------------------
 def get_main_menu_keyboard():
     is_alive = child_process and child_process.poll() is None
-    status_btn = "🟢 Script: RUNNING" if is_alive else "🔴 Script: STOPPED"
+    
+    if is_alive and child_process_name:
+        cu_sec = int(time.time() - child_process_start_time) if child_process_start_time else 0
+        ch, cr = divmod(cu_sec, 3600)
+        cm, _ = divmod(cr, 60)
+        status_btn = f"🟢 {child_process_name} ({ch}h {cm}m)"
+    else:
+        status_btn = "🔴 Script: STOPPED"
+    
+    ram = psutil.virtual_memory()
+    cpu = psutil.cpu_percent(interval=None)
+    stats_btn = f"⚡ CPU: {cpu}% | RAM: {ram.percent}%"
     
     return {
         "inline_keyboard": [
             [
-                {"text": "📊 Server Status", "callback_data": "menu_status"},
-                {"text": status_btn, "callback_data": "menu_status"}
+                {"text": status_btn, "callback_data": "menu_status"},
+                {"text": stats_btn, "callback_data": "menu_status"}
             ],
             [
-                {"text": "🚀 Run Python File", "callback_data": "menu_run_select"},
+                {"text": "🚀 Scripts Runner", "callback_data": "menu_runner"},
                 {"text": "🛑 Stop Script", "callback_data": "menu_stop"}
             ],
             [
@@ -399,11 +415,11 @@ def get_main_menu_keyboard():
             ],
             [
                 {"text": "📂 Workspace Files", "callback_data": "menu_files"},
-                {"text": "📦 Install Pip Package", "callback_data": "menu_pip_prompt"}
+                {"text": "📦 Install Pip", "callback_data": "menu_pip_prompt"}
             ],
             [
-                {"text": "💻 Shell Terminal", "callback_data": "menu_sh_prompt"},
-                {"text": "💾 Sync to GitHub", "callback_data": "menu_sync"}
+                {"text": "💻 Linux Shell", "callback_data": "menu_sh_prompt"},
+                {"text": "💾 Cloud Sync", "callback_data": "menu_sync"}
             ]
         ]
     }
@@ -515,11 +531,13 @@ def handle_text_message(chat_id, user_id, text):
         if len(parts) > 1:
             ok, msg = start_child_app(parts[1])
             send_tg_message(chat_id, msg, reply_markup=get_main_menu_keyboard())
+        elif raw_text in ["/runner", "/run", "/scripts"]:
+            prompt_runner_menu(chat_id, user_id)
         else:
             # Show interactive run menu
             prompt_run_menu(chat_id, user_id)
 
-    elif raw_text in ["/stop", "/stop_app"]:
+    elif raw_text in ["/stop", "/stop_app", "/kill"]:
         ok, msg = stop_child_app()
         send_tg_message(chat_id, msg, reply_markup=get_main_menu_keyboard())
 
@@ -586,25 +604,46 @@ def handle_text_message(chat_id, user_id, text):
 # ---------------------------------------------------------------------------
 # Interactive Submenus
 # ---------------------------------------------------------------------------
-def prompt_run_menu(chat_id, user_id, message_id=None):
-    py_files = [f for f in os.listdir(WORKSPACE_DIR) if f.endswith(".py") and f not in ["app.py"]]
+def prompt_runner_menu(chat_id, user_id, message_id=None):
+    os.makedirs(SCRIPTS_DIR, exist_ok=True)
+    files = sorted([f for f in os.listdir(SCRIPTS_DIR) if f.endswith(".py")])
+    
+    is_alive = child_process and child_process.poll() is None
     
     buttons = []
-    for py in py_files:
-        buttons.append([{"text": f"▶️ Run {py}", "callback_data": f"exec_run_{py}"}])
-    
+    if not files:
+        text = (
+            "🚀 <b>Scripts Runner Manager</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📁 <code>scripts/</code> folder me abhi koi Python file nahi mili.\n\n"
+            "💡 <i>Aap chat me direct koi bhi <code>.py</code> file bhej sakte hain, wo automatically <code>scripts/</code> folder me add ho jayegi!</i>"
+        )
+    else:
+        text = (
+            "🚀 <b>Scripts Runner Manager</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"• <b>Active Process:</b> {'🟢 ' + child_process_name if is_alive else '🔴 None (Stopped)'}\n"
+            f"• <b>Total Scripts in GitHub:</b> {len(files)}\n\n"
+            "<i>Neeche kisi bhi script par click karke use run karein:</i>"
+        )
+        for py in files:
+            is_this_running = is_alive and child_process_name == py
+            btn_prefix = "🟢 [RUNNING] " if is_this_running else "▶️ Run "
+            buttons.append([{"text": f"{btn_prefix}{py}", "callback_data": f"exec_run_{py}"}])
+
     buttons.append([{"text": "📤 Upload New Script", "callback_data": "menu_upload_prompt"}])
+    if is_alive:
+        buttons.append([{"text": "🛑 Stop Current Script", "callback_data": "menu_stop"}])
     buttons.append([{"text": "🔙 Main Menu", "callback_data": "menu_main"}])
-    
-    text = (
-        "🚀 <b>Launch Python Script</b>\n\n"
-        "Choose an existing script from below, or simply <b>send your new .py file in chat</b> to deploy it!"
-    )
+
     markup = {"inline_keyboard": buttons}
     if message_id:
         edit_tg_message(chat_id, message_id, text, reply_markup=markup)
     else:
         send_tg_message(chat_id, text, reply_markup=markup)
+
+def prompt_run_menu(chat_id, user_id, message_id=None):
+    prompt_runner_menu(chat_id, user_id, message_id)
 
 def prompt_pip_menu(chat_id, user_id, message_id=None):
     user_states[user_id] = "WAITING_PIP_PACKAGE"
@@ -661,17 +700,30 @@ def show_logs_view(chat_id, message_id=None):
         send_tg_message(chat_id, text, reply_markup=markup)
 
 def show_files_view(chat_id, message_id=None):
-    items = sorted(os.listdir(WORKSPACE_DIR))
+    os.makedirs(SCRIPTS_DIR, exist_ok=True)
+    script_files = sorted([f for f in os.listdir(SCRIPTS_DIR) if f.endswith(".py")])
+    root_files = sorted([f for f in os.listdir(WORKSPACE_DIR) if os.path.isfile(os.path.join(WORKSPACE_DIR, f)) and not f.startswith(".") and f != "__pycache__"])
+    
     file_lines = []
     download_buttons = []
     
-    for it in items:
-        if it.startswith(".git") or it == "__pycache__":
-            continue
-        p = os.path.join(WORKSPACE_DIR, it)
-        if os.path.isfile(p):
+    if script_files:
+        file_lines.append("<b>📁 scripts/ Folder (GitHub):</b>")
+        for it in script_files:
+            p = os.path.join(SCRIPTS_DIR, it)
             sz = os.path.getsize(p)
-            file_lines.append(f"📄 <code>{it}</code> ({sz} bytes)")
+            file_lines.append(f"  • 📄 <code>{it}</code> ({sz} bytes)")
+            download_buttons.append([
+                {"text": f"📥 scripts/{it}", "callback_data": f"file_dl_scripts/{it}"},
+                {"text": "🗑️ Delete", "callback_data": f"file_del_scripts/{it}"}
+            ])
+    
+    if root_files:
+        file_lines.append("\n<b>📁 Root Workspace:</b>")
+        for it in root_files:
+            p = os.path.join(WORKSPACE_DIR, it)
+            sz = os.path.getsize(p)
+            file_lines.append(f"  • 📄 <code>{it}</code> ({sz} bytes)")
             download_buttons.append([
                 {"text": f"📥 {it}", "callback_data": f"file_dl_{it}"},
                 {"text": "🗑️ Delete", "callback_data": f"file_del_{it}"}
@@ -738,10 +790,10 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
         answer_callback(callback_id, "📊 Status Refreshed!")
         edit_tg_message(chat_id, message_id, render_dashboard_text(), reply_markup=get_main_menu_keyboard())
 
-    # 3. Run Menu
-    elif data == "menu_run_select":
+    # 3. Runner Menu
+    elif data in ["menu_runner", "menu_run_select"]:
         answer_callback(callback_id)
-        prompt_run_menu(chat_id, user_id, message_id)
+        prompt_runner_menu(chat_id, user_id, message_id)
 
     # 4. Execute a specific file
     elif data.startswith("exec_run_"):
@@ -914,21 +966,30 @@ def handle_document_upload(chat_id, user_id, doc):
     
     # 2. If uploaded a .py script
     elif file_name.endswith(".py"):
+        # Save into scripts/ directory
+        script_dest_path = os.path.join(SCRIPTS_DIR, file_name)
+        if dest_path != script_dest_path and os.path.exists(dest_path):
+            import shutil
+            shutil.move(dest_path, script_dest_path)
+        git_sync_to_github(f"Upload {file_name} into scripts/ folder")
+        
         user_states[user_id] = {
             "action": "WAITING_REQ_FOR_PY",
             "target_py": file_name
         }
         
         text = (
-            f"✨ <b>Python Script Saved: {file_name}</b>\n"
+            f"✨ <b>Python Script Saved:</b> <code>scripts/{file_name}</code>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "📦 <b>Ab requirements.txt file bhej dein</b> taaki dependencies install ho sakein.\n\n"
-            "<i>Agar koi extra dependency nahi chahiye, toh neeche button dabakar direct run karein:</i>"
+            "📁 File GitHub repository ke <b>scripts/</b> folder me save ho chuki hai!\n\n"
+            "📦 <b>requirements.txt bhej sakte hain</b> taaki dependencies install ho sakein,\n"
+            "ya neeche button se <b>Direct Run</b> ya <b>Scripts Runner</b> open kar sakte hain:"
         )
         markup = {
             "inline_keyboard": [
-                [{"text": f"▶️ Run {file_name} Now (Skip Requirements)", "callback_data": f"skip_req_{file_name}"}],
-                [{"text": "❌ Cancel", "callback_data": "menu_main"}]
+                [{"text": f"▶️ Run {file_name} Now", "callback_data": f"exec_run_{file_name}"}],
+                [{"text": "🚀 Open Scripts Runner", "callback_data": "menu_runner"}],
+                [{"text": "🔙 Main Menu", "callback_data": "menu_main"}]
             ]
         }
         send_tg_message(chat_id, text, reply_markup=markup)
@@ -991,11 +1052,7 @@ def main():
     logger.info(f"🚀 Telegram Relay Controller Initialized [Run #{RUN_ID}]")
     logger.info("=" * 60)
     
-    # Auto-start previously running script if present
-    auto_file = config.get("auto_run_file", "bot.py")
-    if os.path.exists(os.path.join(WORKSPACE_DIR, auto_file)):
-        logger.info(f"Auto-starting {auto_file}...")
-        start_child_app(auto_file)
+    # NOTE: User scripts DO NOT auto-start on boot. Only Telegram controller runs and waits for Admin to launch scripts via Runner menu.
 
     # Start Telegram polling thread
     tg_thread = threading.Thread(target=telegram_polling_loop, daemon=True, name="TGPolling")
