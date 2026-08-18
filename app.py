@@ -878,7 +878,12 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
     # 10b. Do Delete File Execution
     elif data.startswith("do_delete_file_"):
         fname = data.replace("do_delete_file_", "")
-        fpath = os.path.join(WORKSPACE_DIR, fname)
+        # Check in scripts/ first, then workspace
+        if os.path.exists(os.path.join(SCRIPTS_DIR, fname)):
+            fpath = os.path.join(SCRIPTS_DIR, fname)
+        else:
+            fpath = os.path.join(WORKSPACE_DIR, fname)
+
         if os.path.exists(fpath):
             os.remove(fpath)
             git_sync_to_github(f"Deleted {fname} via Telegram")
@@ -910,17 +915,9 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
         text = (
             "📤 <b>Upload New Python Script</b>\n\n"
             "Abhi chat me apni <code>.py</code> file bhej dein.\n"
-            "Bot usko receive karke turant deploy karne ka option dega!"
+            "Bot usko automatically GitHub ke <code>scripts/</code> folder me save karega!"
         )
         edit_tg_message(chat_id, message_id, text, reply_markup=get_back_keyboard())
-
-    # 15. Skip Requirements Callback
-    elif data.startswith("skip_req_"):
-        fname = data.replace("skip_req_", "")
-        user_states.pop(user_id, None)
-        answer_callback(callback_id, f"Starting {fname}...")
-        ok, msg = start_child_app(fname)
-        send_tg_message(chat_id, msg, reply_markup=get_main_menu_keyboard())
 
 # ---------------------------------------------------------------------------
 # Document & File Upload Handler
@@ -933,24 +930,36 @@ def handle_document_upload(chat_id, user_id, doc):
     
     file_id = doc.get("file_id")
     file_name = doc.get("file_name", f"file_{int(time.time())}")
-    dest_path = os.path.join(WORKSPACE_DIR, file_name)
+    
+    # Save script assets directly into scripts/ folder
+    os.makedirs(SCRIPTS_DIR, exist_ok=True)
+    scripts_path = os.path.join(SCRIPTS_DIR, file_name)
+    root_path = os.path.join(WORKSPACE_DIR, file_name)
     
     send_tg_message(chat_id, f"📥 <b>Receiving {file_name}...</b>")
-    ok, err = download_tg_file(file_id, dest_path)
+    ok, err = download_tg_file(file_id, scripts_path)
     
     if not ok:
         send_tg_message(chat_id, f"❌ Download failed: {err}")
         return
+
+    # If requirements.txt, also sync to root workspace
+    if file_name == "requirements.txt":
+        import shutil
+        try:
+            shutil.copy(scripts_path, root_path)
+        except Exception:
+            pass
     
-    # Auto-commit to GitHub
-    git_sync_to_github(f"Upload {file_name} from Telegram")
+    # Auto-commit to GitHub scripts/ folder
+    git_sync_to_github(f"Upload {file_name} into scripts/ folder")
     
     current_state = user_states.get(user_id)
     
     # 1. If uploaded requirements.txt
     if file_name == "requirements.txt":
-        send_tg_message(chat_id, "📦 <b>requirements.txt received!</b>\n⏳ Installing dependencies in real-time...")
-        res = subprocess.run([sys.executable, "-m", "pip", "install", "-r", dest_path], capture_output=True, text=True)
+        send_tg_message(chat_id, "📦 <b>scripts/requirements.txt received!</b>\n⏳ Installing dependencies in real-time...")
+        res = subprocess.run([sys.executable, "-m", "pip", "install", "-r", scripts_path], capture_output=True, text=True)
         
         # Check if user had previously sent a Python file waiting for this requirements.txt
         if isinstance(current_state, dict) and current_state.get("action") == "WAITING_REQ_FOR_PY":
@@ -962,17 +971,10 @@ def handle_document_upload(chat_id, user_id, doc):
         else:
             out_summary = res.stdout[-2000:] if res.stdout else "All requirements satisfied."
             send_tg_message(chat_id, f"✅ <b>Dependencies Installed:</b>\n<pre>{out_summary}</pre>")
-            prompt_run_menu(chat_id, user_id)
+            prompt_runner_menu(chat_id, user_id)
     
     # 2. If uploaded a .py script
     elif file_name.endswith(".py"):
-        # Save into scripts/ directory
-        script_dest_path = os.path.join(SCRIPTS_DIR, file_name)
-        if dest_path != script_dest_path and os.path.exists(dest_path):
-            import shutil
-            shutil.move(dest_path, script_dest_path)
-        git_sync_to_github(f"Upload {file_name} into scripts/ folder")
-        
         user_states[user_id] = {
             "action": "WAITING_REQ_FOR_PY",
             "target_py": file_name
@@ -995,7 +997,11 @@ def handle_document_upload(chat_id, user_id, doc):
         send_tg_message(chat_id, text, reply_markup=markup)
         
     else:
-        send_tg_message(chat_id, f"✅ <b>{file_name}</b> workspace me save ho gayi aur GitHub par backup ho chuki hai.", reply_markup=get_main_menu_keyboard())
+        send_tg_message(
+            chat_id,
+            f"✅ <b>{file_name}</b> GitHub repository ke <code>scripts/</code> folder me save ho gayi hai.",
+            reply_markup=get_main_menu_keyboard()
+        )
 
 # ---------------------------------------------------------------------------
 # Polling Engine
