@@ -727,10 +727,19 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
         )
         edit_tg_message(chat_id, message_id, text, reply_markup=get_back_keyboard())
 
+    # 15. Skip Requirements Callback
+    elif data.startswith("skip_req_"):
+        fname = data.replace("skip_req_", "")
+        user_states.pop(user_id, None)
+        answer_callback(callback_id, f"Starting {fname}...")
+        ok, msg = start_child_app(fname)
+        send_tg_message(chat_id, msg, reply_markup=get_main_menu_keyboard())
+
 # ---------------------------------------------------------------------------
 # Document & File Upload Handler
 # ---------------------------------------------------------------------------
 def handle_document_upload(chat_id, user_id, doc):
+    global user_states
     if user_id != config.get("admin_id") and config.get("admin_id") is not None:
         send_tg_message(chat_id, "⛔ Access Denied.")
         return
@@ -749,27 +758,48 @@ def handle_document_upload(chat_id, user_id, doc):
     # Auto-commit to GitHub
     git_sync_to_github(f"Upload {file_name} from Telegram")
     
-    # If requirements.txt, auto install
-    if file_name == "requirements.txt":
-        send_tg_message(chat_id, "📦 <b>requirements.txt detected!</b>\nInstalling dependencies...")
-        res = subprocess.run([sys.executable, "-m", "pip", "install", "-r", dest_path], capture_output=True, text=True)
-        send_tg_message(chat_id, f"✅ <b>Dependencies Installed:</b>\n<pre>{res.stdout[-2000:]}</pre>", reply_markup=get_main_menu_keyboard())
+    current_state = user_states.get(user_id)
     
+    # 1. If uploaded requirements.txt
+    if file_name == "requirements.txt":
+        send_tg_message(chat_id, "📦 <b>requirements.txt received!</b>\n⏳ Installing dependencies in real-time...")
+        res = subprocess.run([sys.executable, "-m", "pip", "install", "-r", dest_path], capture_output=True, text=True)
+        
+        # Check if user had previously sent a Python file waiting for this requirements.txt
+        if isinstance(current_state, dict) and current_state.get("action") == "WAITING_REQ_FOR_PY":
+            target_py = current_state.get("target_py", "bot.py")
+            user_states.pop(user_id, None)
+            send_tg_message(chat_id, f"✅ <b>Dependencies installed!</b>\n🚀 Now auto-launching <code>{target_py}</code>...")
+            ok_run, run_msg = start_child_app(target_py)
+            send_tg_message(chat_id, run_msg, reply_markup=get_main_menu_keyboard())
+        else:
+            out_summary = res.stdout[-2000:] if res.stdout else "All requirements satisfied."
+            send_tg_message(chat_id, f"✅ <b>Dependencies Installed:</b>\n<pre>{out_summary}</pre>")
+            prompt_run_menu(chat_id, user_id)
+    
+    # 2. If uploaded a .py script
     elif file_name.endswith(".py"):
+        user_states[user_id] = {
+            "action": "WAITING_REQ_FOR_PY",
+            "target_py": file_name
+        }
+        
         text = (
-            f"✨ <b>{file_name} successfully uploaded!</b>\n\n"
-            "File workspace me save ho gayi hai aur GitHub par backup ho chuki hai.\n"
-            "Kya aap isko abhi start karna chahte hain?"
+            f"✨ <b>Python Script Saved: {file_name}</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📦 <b>Ab requirements.txt file bhej dein</b> taaki dependencies install ho sakein.\n\n"
+            "<i>Agar koi extra dependency nahi chahiye, toh neeche button dabakar direct run karein:</i>"
         )
         markup = {
             "inline_keyboard": [
-                [{"text": f"▶️ Run {file_name} Now", "callback_data": f"exec_run_{file_name}"}],
-                [{"text": "🔙 Main Menu", "callback_data": "menu_main"}]
+                [{"text": f"▶️ Run {file_name} Now (Skip Requirements)", "callback_data": f"skip_req_{file_name}"}],
+                [{"text": "❌ Cancel", "callback_data": "menu_main"}]
             ]
         }
         send_tg_message(chat_id, text, reply_markup=markup)
+        
     else:
-        send_tg_message(chat_id, f"✅ Saved <code>{file_name}</code> to workspace.", reply_markup=get_main_menu_keyboard())
+        send_tg_message(chat_id, f"✅ <b>{file_name}</b> workspace me save ho gayi aur GitHub par backup ho chuki hai.", reply_markup=get_main_menu_keyboard())
 
 # ---------------------------------------------------------------------------
 # Polling Engine
