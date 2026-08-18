@@ -660,6 +660,35 @@ def show_files_view(chat_id, message_id=None):
     else:
         send_tg_message(chat_id, text, reply_markup=markup)
 
+def prompt_stop_menu(chat_id, user_id, message_id=None):
+    is_alive = child_process and child_process.poll() is None
+    if not is_alive or not child_process_name:
+        text = "ℹ️ <b>No Running Scripts</b>\n\nAbhi koi bhi script active/run nahi ho rahi hai."
+        markup = {"inline_keyboard": [[{"text": "🔙 Main Menu", "callback_data": "menu_main"}]]}
+    else:
+        cu_sec = int(time.time() - child_process_start_time) if child_process_start_time else 0
+        ch, cr = divmod(cu_sec, 3600)
+        cm, cs = divmod(cr, 60)
+        
+        text = (
+            "🛑 <b>Running Scripts Manager</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"• <b>Active Script:</b> <code>{child_process_name}</code>\n"
+            f"• <b>PID:</b> <code>{child_process.pid}</code>\n"
+            f"• <b>Uptime:</b> {ch}h {cm}m {cs}s\n\n"
+            "<i>Neeche script par click karein aur stop confirm karein:</i>"
+        )
+        markup = {
+            "inline_keyboard": [
+                [{"text": f"🛑 Stop {child_process_name}", "callback_data": f"confirm_stop_prompt_{child_process_name}"}],
+                [{"text": "🔙 Main Menu", "callback_data": "menu_main"}]
+            ]
+        }
+    if message_id:
+        edit_tg_message(chat_id, message_id, text, reply_markup=markup)
+    else:
+        send_tg_message(chat_id, text, reply_markup=markup)
+
 # ---------------------------------------------------------------------------
 # Callback Query Handler (Button Clicks)
 # ---------------------------------------------------------------------------
@@ -691,11 +720,34 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
         ok, msg = start_child_app(fname)
         send_tg_message(chat_id, msg, reply_markup=get_main_menu_keyboard())
 
-    # 5. Stop Script
+    # 5. Stop Script Menu
     elif data == "menu_stop":
+        answer_callback(callback_id)
+        prompt_stop_menu(chat_id, user_id, message_id)
+
+    # 5b. Confirm Stop Prompt
+    elif data.startswith("confirm_stop_prompt_"):
+        fname = data.replace("confirm_stop_prompt_", "")
+        answer_callback(callback_id)
+        text = (
+            f"⚠️ <b>Confirmation Required</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Kya aap sach me <code>{fname}</code> script ko <b>STOP / TERMINATE</b> karna chahte hain?"
+        )
+        markup = {
+            "inline_keyboard": [
+                [{"text": f"🛑 Yes, Stop {fname}", "callback_data": f"do_stop_{fname}"}],
+                [{"text": "❌ Cancel (Keep Running)", "callback_data": "menu_main"}]
+            ]
+        }
+        edit_tg_message(chat_id, message_id, text, reply_markup=markup)
+
+    # 5c. Do Stop Execution
+    elif data.startswith("do_stop_"):
+        fname = data.replace("do_stop_", "")
         ok, msg = stop_child_app()
-        answer_callback(callback_id, "Stopped!" if ok else "Not running")
-        send_tg_message(chat_id, msg, reply_markup=get_main_menu_keyboard())
+        answer_callback(callback_id, f"{fname} stopped!", show_alert=True)
+        edit_tg_message(chat_id, message_id, f"🛑 <b>{fname} ko successfully stop kar diya gaya!</b>", reply_markup=get_main_menu_keyboard())
 
     # 6. Restart Script
     elif data == "menu_restart":
@@ -723,9 +775,27 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
         else:
             answer_callback(callback_id, "File not found!", show_alert=True)
 
-    # 10. Delete File
+    # 10. Delete File Prompt (Confirmation)
     elif data.startswith("file_del_"):
         fname = data.replace("file_del_", "")
+        answer_callback(callback_id)
+        text = (
+            f"⚠️ <b>Confirm File Deletion</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Kya aap sach me <code>{fname}</code> ko <b>delete</b> karna chahte hain?\n\n"
+            "<i>Yeh file workspace aur GitHub repo dono se permanent remove ho jayegi.</i>"
+        )
+        markup = {
+            "inline_keyboard": [
+                [{"text": f"🗑️ Yes, Delete {fname}", "callback_data": f"do_delete_file_{fname}"}],
+                [{"text": "❌ Cancel", "callback_data": "menu_files"}]
+            ]
+        }
+        edit_tg_message(chat_id, message_id, text, reply_markup=markup)
+
+    # 10b. Do Delete File Execution
+    elif data.startswith("do_delete_file_"):
+        fname = data.replace("do_delete_file_", "")
         fpath = os.path.join(WORKSPACE_DIR, fname)
         if os.path.exists(fpath):
             os.remove(fpath)
