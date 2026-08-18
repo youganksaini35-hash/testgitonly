@@ -276,15 +276,20 @@ def install_script_requirements(py_filename):
         return False, str(e)
 
 # ---------------------------------------------------------------------------
-# Security & Resource Guard Shield (>60% CPU, Crypto-Mining, Loop Detector)
+# Security & Resource Guard Shield (Crypto, DDoS, Infinite Loop, Mass Spam)
 # ---------------------------------------------------------------------------
 CRYPTO_SIGNATURES = [
     "stratum+tcp://", "stratum+ssl://", "xmrig", "cryptonight", "minerd",
     "ethminer", "monero", "hashrate", "coinhive", "nicehash", "stratum"
 ]
 
+DDOS_SPAM_SIGNATURES = [
+    "syn flood", "udp flood", "slowloris", "http flood", "dos attack",
+    "ddos attack", "packet flood", "mass spam"
+]
+
 def scan_script_for_abuse(fpath):
-    """Scans Python script source code for crypto-mining and dangerous abuse patterns."""
+    """Scans Python script source code for crypto-mining, DDoS, and dangerous abuse patterns."""
     if not os.path.exists(fpath):
         return None
     try:
@@ -292,7 +297,10 @@ def scan_script_for_abuse(fpath):
             content = f.read().lower()
         for sig in CRYPTO_SIGNATURES:
             if sig in content:
-                return f"Crypto-Mining Signature Detected ('{sig}')"
+                return f"⛏️ Crypto-Mining Signature Detected ('{sig}')"
+        for sig in DDOS_SPAM_SIGNATURES:
+            if sig in content:
+                return f"🌊 DDoS / Attack Signature Detected ('{sig}')"
     except Exception:
         pass
     return None
@@ -329,9 +337,11 @@ def trigger_guard_violation(fname, reason, peak_cpu, peak_ram_mb):
     notify_all_admins(alert_text, reply_markup=markup)
 
 def resource_guard_monitor(proc, fname):
-    """Monitors CPU and RAM of running child process. Auto-stops if >60% CPU sustained or abuse detected."""
+    """Real-time Guard: Detects Crypto-Mining, >60% CPU Loops, DDoS Socket Floods, and Mass Spamming."""
     high_cpu_count = 0
     max_cpu_seen = 0.0
+    last_log_count = len(child_logs)
+    last_check_time = time.time()
     
     try:
         ps_proc = psutil.Process(proc.pid)
@@ -340,33 +350,64 @@ def resource_guard_monitor(proc, fname):
 
     while proc.poll() is None:
         try:
-            # Measure CPU load of child process (including its worker threads)
+            # 1. Measure CPU and RAM
             cpu_usage = ps_proc.cpu_percent(interval=2.0)
             mem_info = ps_proc.memory_info()
             ram_mb = mem_info.rss // (1024 * 1024)
             if cpu_usage > max_cpu_seen:
                 max_cpu_seen = cpu_usage
 
-            # Check recent logs for crypto miner strings
+            now = time.time()
+            dt = max(0.5, now - last_check_time)
+            current_log_count = len(child_logs)
+            logs_per_sec = (current_log_count - last_log_count) / dt
+            last_log_count = current_log_count
+            last_check_time = now
+
+            # 2. ⛏️ Crypto-Mining Detection in Execution Logs
             recent_logs_str = " ".join(child_logs[-15:]).lower() if child_logs else ""
             for sig in CRYPTO_SIGNATURES:
                 if sig in recent_logs_str:
                     trigger_guard_violation(
                         fname,
-                        reason=f"Crypto-Mining Activity Detected (Keyword: <code>{sig}</code>)",
+                        reason=f"⛏️ Crypto-Mining Activity Detected (Signature: <code>{sig}</code>)",
                         peak_cpu=cpu_usage,
                         peak_ram_mb=ram_mb
                     )
                     return
 
-            # Check for sustained High CPU (>60% threshold for 3 consecutive checks ~ 6-8 seconds)
+            # 3. 🌊 DDoS & Network Flooding Detection (Open Socket Threshold > 120)
+            try:
+                open_conns = len(ps_proc.net_connections(kind='inet'))
+                if open_conns > 120:
+                    trigger_guard_violation(
+                        fname,
+                        reason=f"🌊 DDoS / Network Socket Flood Detected ({open_conns} concurrent network sockets)",
+                        peak_cpu=cpu_usage,
+                        peak_ram_mb=ram_mb
+                    )
+                    return
+            except (psutil.AccessDenied, Exception):
+                pass
+
+            # 4. 📩 Mass Spamming Rate Limiter (>40 log lines / burst per sec without sleep)
+            if logs_per_sec > 40.0:
+                trigger_guard_violation(
+                    fname,
+                    reason=f"📩 Mass Spamming Rate Limit Exceeded ({logs_per_sec:.0f} requests/logs per sec)",
+                    peak_cpu=cpu_usage,
+                    peak_ram_mb=ram_mb
+                )
+                return
+
+            # 5. 🔄 Heavy Infinite Loop Detection (>60% CPU for 3 consecutive checks ~ 6s)
             if cpu_usage > 60.0:
                 high_cpu_count += 1
-                logger.warning(f"⚠️ [ResourceGuard] High CPU usage detected on {fname}: {cpu_usage:.1f}% ({high_cpu_count}/3)")
+                logger.warning(f"⚠️ [ResourceGuard] High CPU usage on {fname}: {cpu_usage:.1f}% ({high_cpu_count}/3)")
                 if high_cpu_count >= 3:
                     trigger_guard_violation(
                         fname,
-                        reason=f"Sustained High CPU Load (>60% Threshold: {cpu_usage:.1f}%) - Runaway Loop or Resource Abuse",
+                        reason=f"🔄 Sustained High CPU Load (>60% Limit: {cpu_usage:.1f}%) - Runaway Infinite Loop Detected",
                         peak_cpu=cpu_usage,
                         peak_ram_mb=ram_mb
                     )
