@@ -874,6 +874,9 @@ def main():
         time.sleep(5)
     
     # --- HANDOFF SEQUENCE ---
+    global IS_RUNNING
+    IS_RUNNING = False # Stop Telegram polling immediately on old runner
+    
     if config.get("admin_id"):
         send_tg_message(
             config["admin_id"],
@@ -884,7 +887,7 @@ def main():
     stop_child_app()
     git_sync_to_github("Auto-backup before Relay Handoff")
     trigger_next_runner()
-    time.sleep(15)
+    time.sleep(5)
     logger.info("Handoff sequence complete. Exiting.")
 
 if __name__ == "__main__":
