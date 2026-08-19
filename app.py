@@ -202,6 +202,9 @@ def git_sync_to_github(commit_message="Update via Telegram Controller"):
         remote_url = f"https://{GH_PAT}@github.com/{REPO}.git"
         subprocess.run(["git", "config", "user.name", "TelegramController"], check=True)
         subprocess.run(["git", "config", "user.email", "bot@controller.local"], check=True)
+        
+        # Pull any remote changes with rebase first
+        subprocess.run(["git", "pull", "--rebase", remote_url, "main"], capture_output=True)
         subprocess.run(["git", "add", "."], check=True)
         
         status = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
@@ -214,6 +217,12 @@ def git_sync_to_github(commit_message="Update via Telegram Controller"):
             logger.info("Auto-sync to cloud complete.")
             return True, "Cloud sync complete! All changes backed up."
         else:
+            # If rejected, try rebase once and push again
+            subprocess.run(["git", "pull", "--rebase", remote_url, "main"], capture_output=True)
+            push_res = subprocess.run(["git", "push", remote_url, "main"], capture_output=True, text=True)
+            if push_res.returncode == 0:
+                logger.info("Auto-sync to cloud complete after rebase.")
+                return True, "Cloud sync complete! All changes backed up."
             logger.error(f"Git push error: {push_res.stderr}")
             return False, f"Cloud Sync error: {push_res.stderr[-200:]}"
     except Exception as e:
@@ -691,18 +700,62 @@ def stop_child_app(script_name=None, clear_active=True):
     return False, "ℹ️ No running script found to stop."
 
 def restart_child_app(script_name=None):
+    """Restarts a specific script, or restarts ALL running/persistent scripts in parallel."""
     active = get_active_running_processes()
+    
     if script_name:
         stop_child_app(script_name=script_name, clear_active=False)
-        time.sleep(1)
+        time.sleep(1.0)
         return start_child_app(script_name)
-    elif active:
-        target = list(active.keys())[0]
-        stop_child_app(script_name=target, clear_active=False)
-        time.sleep(1)
-        return start_child_app(target)
+    
+    # Identify all targets to restart
+    targets = list(active.keys())
+    if not targets:
+        targets = config.get("active_scripts", [])
+    if not targets and config.get("active_script"):
+        targets = [config["active_script"]]
+    if not targets:
+        vault_scripts = list(config.get("env_vault", {}).keys())
+        for s in vault_scripts:
+            sp = os.path.join(SCRIPTS_DIR, s)
+            if os.path.exists(sp) and s not in targets:
+                targets.append(s)
+    if not targets:
+        for root, _, fs in os.walk(SCRIPTS_DIR):
+            for f in fs:
+                if f.endswith(".py") and not f.startswith("."):
+                    rel = os.path.relpath(os.path.join(root, f), SCRIPTS_DIR)
+                    if is_runnable_entry_point(rel) and rel not in targets:
+                        targets.append(rel)
+                
+    if not targets:
+        return False, "ℹ️ No scripts found to restart in <code>scripts/</code>."
+        
+    # Stop all targets cleanly without clearing persistence
+    stop_child_app(script_name=None, clear_active=False)
+    time.sleep(1.5)
+    
+    success_list = []
+    fail_list = []
+    
+    for s in targets:
+        ok, res_msg = start_child_app(s)
+        if ok:
+            success_list.append(s)
+        else:
+            fail_list.append(f"<code>{s}</code> ({res_msg})")
+        time.sleep(0.5)
+        
+    if success_list and not fail_list:
+        return True, f"🔄 <b>Restarted {len(success_list)} scripts successfully in parallel:</b>\n" + "\n".join([f"• 🟢 <code>{s}</code>" for s in success_list])
+    elif success_list and fail_list:
+        return True, (
+            f"🔄 <b>Partial Restart:</b>\n"
+            f"• <b>Started:</b> " + ", ".join([f"<code>{s}</code>" for s in success_list]) + "\n"
+            f"• <b>Errors:</b>\n" + "\n".join(fail_list)
+        )
     else:
-        return start_child_app("bot.py")
+        return False, f"❌ <b>Restart failed:</b>\n" + "\n".join(fail_list)
 
 # ---------------------------------------------------------------------------
 # Self-Trigger: Next Runner Launch (Relay Handoff)
@@ -2313,19 +2366,21 @@ def main():
     if not active_list and config.get("active_script"):
         active_list = [config["active_script"]]
 
-    # Auto-recovery fallback: If active_list is empty, check vault configured scripts or default bots
+    # Auto-recovery fallback: If active_list is empty, check vault configured scripts or all runnable entry points
     if not active_list:
         vault_scripts = list(config.get("env_vault", {}).keys())
         for s in vault_scripts:
             sp = os.path.join(SCRIPTS_DIR, s)
-            if os.path.exists(sp):
+            if os.path.exists(sp) and s not in active_list:
                 active_list.append(s)
 
     if not active_list:
-        for candidate in ["bot/bot.py", "bot/main.py", "bot.py", "main.py"]:
-            if os.path.exists(os.path.join(SCRIPTS_DIR, candidate)):
-                active_list.append(candidate)
-                break
+        for root, _, fs in os.walk(SCRIPTS_DIR):
+            for f in fs:
+                if f.endswith(".py") and not f.startswith("."):
+                    rel = os.path.relpath(os.path.join(root, f), SCRIPTS_DIR)
+                    if is_runnable_entry_point(rel) and rel not in active_list:
+                        active_list.append(rel)
 
     if active_list:
         logger.info(f"🔄 Auto-resuming {len(active_list)} active scripts across relay handoff/boot: {active_list}")
@@ -2336,10 +2391,16 @@ def main():
                 f"Auto-resuming {len(scripts_to_run)} scripts in parallel:\n"
                 + "\n".join([f"• <code>{s}</code>" for s in scripts_to_run])
             )
+            success_count = 0
             for s in scripts_to_run:
-                start_child_app(s)
+                ok, msg = start_child_app(s)
+                if ok:
+                    success_count += 1
+                else:
+                    notify_all_admins(f"⚠️ <b>Auto-resume error for <code>{s}</code>:</b>\n{msg}")
                 time.sleep(0.5)
-            notify_all_admins("🟢 <b>All persistent scripts are now running!</b>", reply_markup=get_main_menu_keyboard())
+            if success_count > 0:
+                notify_all_admins(f"🟢 <b>{success_count}/{len(scripts_to_run)} scripts are now active and running in parallel!</b>", reply_markup=get_main_menu_keyboard())
         threading.Thread(target=delayed_multi_resume, args=(active_list,), daemon=True).start()
 
     # Start Telegram polling thread
