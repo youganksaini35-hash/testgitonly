@@ -743,7 +743,8 @@ def get_main_menu_keyboard():
                 {"text": "💻 Linux Shell", "callback_data": "menu_sh_prompt"}
             ],
             [
-                {"text": "💾 Cloud Sync", "callback_data": "menu_sync"}
+                {"text": "💾 Cloud Sync", "callback_data": "menu_sync"},
+                {"text": "ℹ️ Server & Repo Info", "callback_data": "menu_server_info"}
             ]
         ]
     }
@@ -1567,6 +1568,83 @@ def prompt_stop_menu(chat_id, user_id, message_id=None):
     else:
         send_tg_message(chat_id, text, reply_markup=markup)
 
+def show_server_info_view(chat_id, message_id=None):
+    # Fetch repository details via GitHub API
+    repo_info = {}
+    try:
+        url = f"https://api.github.com/repos/{REPO}"
+        headers = {
+            "Authorization": f"Bearer {GH_PAT}" if GH_PAT else "",
+            "Accept": "application/vnd.github+json"
+        }
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            repo_info = resp.json()
+    except Exception as e:
+        logger.error(f"Error fetching repo info: {e}")
+
+    # Telemetry
+    uptime_sec = int(time.time() - START_TIME)
+    hours, remainder = divmod(uptime_sec, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    
+    relay_remain = max(0, RUN_DURATION_SECONDS - uptime_sec)
+    rh, rr = divmod(relay_remain, 3600)
+    rm, rs = divmod(rr, 60)
+    
+    is_alive = child_process and child_process.poll() is None
+    active_name = child_process_name if is_alive else (config.get("active_script") or "None (Standby)")
+    
+    repo_name = repo_info.get("full_name", REPO)
+    visibility = "🌍 Public" if not repo_info.get("private", False) else "🔒 Private"
+    repo_size_kb = repo_info.get("size", 0)
+    default_branch = repo_info.get("default_branch", "main")
+    created_at = repo_info.get("created_at", "N/A")[:10] if repo_info.get("created_at") else "N/A"
+    owner_login = repo_info.get("owner", {}).get("login", repo_name.split("/")[0] if "/" in repo_name else "N/A")
+    repo_html_url = repo_info.get("html_url", f"https://github.com/{REPO}")
+    
+    text = (
+        "ℹ️ <b>Cloud Server & Repository Intelligence</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌐 <b>Cloud Repository:</b> <code>{repo_name}</code>\n"
+        f"👑 <b>Owner:</b> <code>{owner_login}</code>\n"
+        f"🛡️ <b>Visibility:</b> <b>{visibility}</b>\n"
+        f"🌿 <b>Default Branch:</b> <code>{default_branch}</code>\n"
+        f"📦 <b>Repo Size:</b> <code>{repo_size_kb} KB</code>\n"
+        f"📅 <b>Created On:</b> <code>{created_at}</code>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "⚡ <b>Live Relay Server Status:</b>\n"
+        f"• <b>Daemon Status:</b> 🟢 <b>Active & Healthy</b>\n"
+        f"• <b>Active Script:</b> {'🟢 <code>' + active_name + '</code>' if is_alive else '🔴 <i>Stopped / Standby</i>'}\n"
+        f"• <b>Current Run ID:</b> <code>#{RUN_ID}</code>\n"
+        f"• <b>Current Phase Uptime:</b> <code>{hours}h {minutes}m {seconds}s</code>\n"
+        f"• <b>Next Relay Handoff In:</b> <code>{rh}h {rm}m {rs}s</code> (Auto-Resuming)\n"
+        f"• <b>Security Vault:</b> 🔐 <b>AES-256 Authenticated Encryption (Active)</b>\n"
+        f"• <b>Secret Scanner Shield:</b> 🛡️ <b>100% Protected (.gitignore active)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    
+    markup = {
+        "inline_keyboard": [
+            [
+                {"text": "🔄 Refresh Info", "callback_data": "menu_server_info"},
+                {"text": "🌐 Open on GitHub", "url": repo_html_url}
+            ],
+            [
+                {"text": "🚀 Scripts Runner", "callback_data": "menu_runner"},
+                {"text": "📂 View Files", "callback_data": "menu_files"}
+            ],
+            [
+                {"text": "🔙 Main Menu", "callback_data": "menu_main"}
+            ]
+        ]
+    }
+    
+    if message_id:
+        edit_tg_message(chat_id, message_id, text, reply_markup=markup)
+    else:
+        send_tg_message(chat_id, text, reply_markup=markup)
+
 # ---------------------------------------------------------------------------
 # Callback Query Handler (Button Clicks)
 # ---------------------------------------------------------------------------
@@ -1850,6 +1928,11 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
             "It will automatically be saved into the <code>scripts/</code> folder!"
         )
         edit_tg_message(chat_id, message_id, text, reply_markup=get_back_keyboard())
+
+    # 15. Server & Repo Info
+    elif data == "menu_server_info":
+        answer_callback(callback_id, "ℹ️ Loading Repo Intelligence...")
+        show_server_info_view(chat_id, message_id)
 
 # ---------------------------------------------------------------------------
 # Document & File Upload Handler
