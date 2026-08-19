@@ -641,6 +641,9 @@ def start_child_app(filename="bot.py"):
         config["active_scripts"] = active_list
         save_config(config)
         
+        # Immediately lock running state to GitHub cloud in background
+        threading.Thread(target=git_sync_to_github, args=(f"Set active scripts: {', '.join(active_list)}",), daemon=True).start()
+        
         req_note = f" (📦 {os.path.basename(req_path)})" if req_path else " (📄 Standalone)"
         return True, f"✨ <b>{clean_name}</b> started successfully!{req_note}\n🆔 PID: <code>{proc.pid}</code>\n🟢 <b>Active Scripts:</b> {len(active_list)} running concurrently"
     except Exception as e:
@@ -678,6 +681,7 @@ def stop_child_app(script_name=None, clear_active=True):
         active_list = list(get_active_running_processes().keys())
         config["active_scripts"] = active_list
         save_config(config)
+        threading.Thread(target=git_sync_to_github, args=("Update active scripts on stop",), daemon=True).start()
 
     if stopped_names:
         if len(stopped_names) == 1:
@@ -2309,12 +2313,26 @@ def main():
     if not active_list and config.get("active_script"):
         active_list = [config["active_script"]]
 
+    # Auto-recovery fallback: If active_list is empty, check vault configured scripts or default bots
+    if not active_list:
+        vault_scripts = list(config.get("env_vault", {}).keys())
+        for s in vault_scripts:
+            sp = os.path.join(SCRIPTS_DIR, s)
+            if os.path.exists(sp):
+                active_list.append(s)
+
+    if not active_list:
+        for candidate in ["bot/bot.py", "bot/main.py", "bot.py", "main.py"]:
+            if os.path.exists(os.path.join(SCRIPTS_DIR, candidate)):
+                active_list.append(candidate)
+                break
+
     if active_list:
-        logger.info(f"🔄 Auto-resuming {len(active_list)} active scripts across relay handoff: {active_list}")
+        logger.info(f"🔄 Auto-resuming {len(active_list)} active scripts across relay handoff/boot: {active_list}")
         def delayed_multi_resume(scripts_to_run):
             time.sleep(2.0)
             notify_all_admins(
-                f"🔄 <b>New Relay Phase Active:</b>\n"
+                f"🔄 <b>Cloud Server Online / Restarted:</b>\n"
                 f"Auto-resuming {len(scripts_to_run)} scripts in parallel:\n"
                 + "\n".join([f"• <code>{s}</code>" for s in scripts_to_run])
             )
