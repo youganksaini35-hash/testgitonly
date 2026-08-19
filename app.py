@@ -43,16 +43,24 @@ SCRIPTS_DIR = os.path.join(WORKSPACE_DIR, "scripts")
 os.makedirs(SCRIPTS_DIR, exist_ok=True)
 CONFIG_FILE = os.path.join(WORKSPACE_DIR, "bot_config.json")
 
-# State & Processes
-child_process = None
-child_process_name = None
-child_process_start_time = None
-is_intentionally_stopped = False
-child_logs = []
+# Multi-Process Concurrent Runner State:
+# running_processes = { "clean_name": { "proc": Popen, "start_time": float, "logs": [], "is_stopped": bool, "pid": int } }
+running_processes = {}
 LOG_BUFFER_MAX = 200
 
 # User conversation states (for interactive step-by-step inputs)
 user_states = {}
+
+def get_active_running_processes():
+    """Returns dict of currently active running processes."""
+    active = {}
+    for name, pdata in list(running_processes.items()):
+        proc = pdata.get("proc")
+        if proc and proc.poll() is None:
+            active[name] = pdata
+        else:
+            running_processes.pop(name, None)
+    return active
 
 # ---------------------------------------------------------------------------
 # Telegram API Helpers (Buttons & Messages)
@@ -214,22 +222,22 @@ def git_sync_to_github(commit_message="Update via Telegram Controller"):
 # ---------------------------------------------------------------------------
 # Process Manager (Run, Stop, Restart Scripts)
 # ---------------------------------------------------------------------------
-def append_log(line):
-    global child_logs
+def append_log(fname, line):
     timestamp = datetime.now().strftime("%H:%M:%S")
     formatted = f"[{timestamp}] {line}"
-    child_logs.append(formatted)
-    if len(child_logs) > LOG_BUFFER_MAX:
-        child_logs.pop(0)
+    if fname in running_processes:
+        logs = running_processes[fname].setdefault("logs", [])
+        logs.append(formatted)
+        if len(logs) > LOG_BUFFER_MAX:
+            logs.pop(0)
+    logger.info(f"[{fname}] {line}")
 
-def log_stream_reader(pipe):
+def log_stream_reader(pipe, fname):
     try:
         for line in iter(pipe.readline, ''):
             if not line:
                 break
-            clean = line.rstrip()
-            append_log(clean)
-            logger.info(f"[ChildApp] {clean}")
+            append_log(fname, line.rstrip())
         pipe.close()
     except Exception:
         pass
@@ -319,10 +327,11 @@ def trigger_guard_violation(fname, reason, peak_cpu, peak_ram_mb):
     """Safely terminates the offending process and alerts all admins with logs and reasons."""
     logger.error(f"🚨 [SecurityGuard] Terminating {fname} due to policy violation: {reason}")
     
-    recent_logs = "\n".join(child_logs[-25:]) if child_logs else "(No output recorded)"
+    pdata = running_processes.get(fname, {})
+    recent_logs = "\n".join(pdata.get("logs", [])[-25:]) if pdata.get("logs") else "(No output recorded)"
     escaped_logs = html.escape(recent_logs)
     
-    stop_child_app()
+    stop_child_app(script_name=fname)
     
     alert_text = (
         "🚨 <b>SECURITY & RESOURCE GUARD ALERT</b>\n"
@@ -336,11 +345,11 @@ def trigger_guard_violation(fname, reason, peak_cpu, peak_ram_mb):
         "📋 <b>Recent Execution Logs:</b>\n"
         f"<pre>{escaped_logs[-2000:]}</pre>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "💡 <i>Your server has been protected. Review script code before restarting.</i>"
+        "💡 <i>Your server has been protected. Other running scripts remain active.</i>"
     )
     markup = {
         "inline_keyboard": [
-            [{"text": "📋 View Live Logs", "callback_data": "menu_logs"}, {"text": "🚀 Scripts Runner", "callback_data": "menu_runner"}],
+            [{"text": f"📋 Logs: {fname}", "callback_data": f"show_log_for_{fname}"}, {"text": "🚀 Scripts Runner", "callback_data": "menu_runner"}],
             [{"text": "🔙 Main Menu", "callback_data": "menu_main"}]
         ]
     }
@@ -350,7 +359,7 @@ def resource_guard_monitor(proc, fname):
     """Real-time Guard: Detects Crypto-Mining, >60% CPU Loops, DDoS Socket Floods, and Mass Spamming."""
     high_cpu_count = 0
     max_cpu_seen = 0.0
-    last_log_count = len(child_logs)
+    last_log_count = 0
     last_check_time = time.time()
     
     try:
@@ -369,13 +378,14 @@ def resource_guard_monitor(proc, fname):
 
             now = time.time()
             dt = max(0.5, now - last_check_time)
-            current_log_count = len(child_logs)
+            pdata = running_processes.get(fname, {})
+            current_log_count = len(pdata.get("logs", []))
             logs_per_sec = (current_log_count - last_log_count) / dt
             last_log_count = current_log_count
             last_check_time = now
 
             # 2. ⛏️ Crypto-Mining Detection in Execution Logs
-            recent_logs_str = " ".join(child_logs[-15:]).lower() if child_logs else ""
+            recent_logs_str = " ".join(pdata.get("logs", [])[-15:]).lower()
             for sig in CRYPTO_SIGNATURES:
                 if sig in recent_logs_str:
                     trigger_guard_violation(
@@ -435,64 +445,64 @@ def resource_guard_monitor(proc, fname):
 def child_watchdog(proc, fname):
     """Watches the running child process and sends alert if it exits or crashes."""
     ret = proc.wait()
-    global child_process, child_process_name, child_process_start_time, is_intentionally_stopped
+    pdata = running_processes.get(fname, {})
+    is_stopped = pdata.get("is_stopped", False)
     
-    # Only act if this is still the registered active process
-    if child_process == proc:
-        child_process = None
-        child_process_name = None
-        child_process_start_time = None
-        
-        # If stopped intentionally by admin or terminated via SIGKILL/SIGTERM, skip crash alert
-        if is_intentionally_stopped or ret in [-9, -15, 137, 143]:
-            logger.info(f"Process {fname} stopped cleanly by admin (Exit code: {ret}).")
-            is_intentionally_stopped = False
-            return
-        
-        recent_err = "\n".join(child_logs[-20:]) if child_logs else "(No output recorded)"
-        escaped_err = html.escape(recent_err)
-        
-        if config.get("admin_ids"):
-            if ret != 0:
-                missing_mod = extract_missing_module(recent_err)
-                if missing_mod:
-                    alert_text = (
-                        f"⚠️ <b>Script Crashed: Missing Module <code>{missing_mod}</code></b>\n"
-                        f"📁 <b>Script:</b> <code>{fname}</code>\n"
-                        f"🔴 <b>Exit Code:</b> <code>{ret}</code>\n\n"
-                        f"<b>Error Traceback:</b>\n"
-                        f"<pre>{escaped_err[-2000:]}</pre>\n\n"
-                        f"💡 <i>Click below to auto-install <b>{missing_mod}</b> and restart:</i>"
-                    )
-                    markup = {
-                        "inline_keyboard": [
-                            [{"text": f"📦 Auto-Install {missing_mod} & Run", "callback_data": f"autofix_pkg_{missing_mod}_{fname}"}],
-                            [{"text": "📋 Live Logs", "callback_data": "menu_logs"}, {"text": "🔙 Main Menu", "callback_data": "menu_main"}]
-                        ]
-                    }
-                else:
-                    alert_text = (
-                        f"⚠️ <b>Script Crashed / Exited!</b>\n"
-                        f"📁 <b>File:</b> <code>{fname}</code>\n"
-                        f"🔴 <b>Exit Code:</b> <code>{ret}</code>\n\n"
-                        f"<b>Error Traceback:</b>\n"
-                        f"<pre>{escaped_err[-2500:]}</pre>\n\n"
-                        f"💡 <i>Tip: Use <b>Install Pip Package</b> if a dependency is missing.</i>"
-                    )
-                    markup = {
-                        "inline_keyboard": [
-                            [{"text": "📦 Install Pip Package", "callback_data": "menu_pip_prompt"}],
-                            [{"text": "🔄 Try Restarting", "callback_data": f"exec_run_{fname}"}],
-                            [{"text": "🔙 Main Menu", "callback_data": "menu_main"}]
-                        ]
-                    }
+    running_processes.pop(fname, None)
+    active_scripts = list(get_active_running_processes().keys())
+    config["active_scripts"] = active_scripts
+    save_config(config)
+
+    # If stopped intentionally by admin or terminated via SIGKILL/SIGTERM, skip crash alert
+    if is_stopped or ret in [-9, -15, 137, 143]:
+        logger.info(f"Process {fname} stopped cleanly by admin (Exit code: {ret}).")
+        return
+    
+    recent_err = "\n".join(pdata.get("logs", [])[-20:]) if pdata.get("logs") else "(No output recorded)"
+    escaped_err = html.escape(recent_err)
+    
+    if config.get("admin_ids"):
+        if ret != 0:
+            missing_mod = extract_missing_module(recent_err)
+            if missing_mod:
+                alert_text = (
+                    f"⚠️ <b>Script Crashed: Missing Module <code>{missing_mod}</code></b>\n"
+                    f"📁 <b>Script:</b> <code>{fname}</code>\n"
+                    f"🔴 <b>Exit Code:</b> <code>{ret}</code>\n\n"
+                    f"<b>Error Traceback:</b>\n"
+                    f"<pre>{escaped_err[-2000:]}</pre>\n\n"
+                    f"💡 <i>Click below to auto-install <b>{missing_mod}</b> and restart:</i>"
+                )
+                markup = {
+                    "inline_keyboard": [
+                        [{"text": f"📦 Auto-Install {missing_mod} & Run", "callback_data": f"autofix_pkg_{missing_mod}_{fname}"}],
+                        [{"text": f"📋 Logs: {fname}", "callback_data": f"show_log_for_{fname}"}],
+                        [{"text": "🔙 Main Menu", "callback_data": "menu_main"}]
+                    ]
+                }
             else:
                 alert_text = (
-                    f"ℹ️ <b>Script Completed:</b> <code>{fname}</code> exited normally (Code 0).\n\n"
-                    f"<b>Output:</b>\n<pre>{escaped_err[-2000:]}</pre>"
+                    f"⚠️ <b>Script Crashed / Exited!</b>\n"
+                    f"📁 <b>File:</b> <code>{fname}</code>\n"
+                    f"🔴 <b>Exit Code:</b> <code>{ret}</code>\n\n"
+                    f"<b>Error Traceback:</b>\n"
+                    f"<pre>{escaped_err[-2500:]}</pre>\n\n"
+                    f"💡 <i>Tip: Use <b>Install Pip Package</b> if a dependency is missing.</i>"
                 )
-                markup = get_main_menu_keyboard()
-            notify_all_admins(alert_text, reply_markup=markup)
+                markup = {
+                    "inline_keyboard": [
+                        [{"text": "📦 Install Pip Package", "callback_data": "menu_pip_prompt"}],
+                        [{"text": f"🔄 Restart {fname}", "callback_data": f"exec_run_{fname}"}],
+                        [{"text": "🔙 Main Menu", "callback_data": "menu_main"}]
+                    ]
+                }
+        else:
+            alert_text = (
+                f"ℹ️ <b>Script Completed:</b> <code>{fname}</code> finished execution (Code 0).\n\n"
+                f"<b>Output:</b>\n<pre>{escaped_err[-2000:]}</pre>"
+            )
+            markup = get_main_menu_keyboard()
+        notify_all_admins(alert_text, reply_markup=markup)
 
 installed_req_hashes = {}
 
@@ -515,9 +525,6 @@ def check_and_install_reqs(req_path):
         logger.error(f"Error checking requirements hash: {e}")
 
 def start_child_app(filename="bot.py"):
-    global child_process, child_process_name, child_process_start_time, child_logs, is_intentionally_stopped
-    is_intentionally_stopped = False
-    
     # Strip any prefix like scripts/
     clean_name = filename.replace("scripts/", "").lstrip("/")
     full_path = os.path.join(SCRIPTS_DIR, clean_name)
@@ -542,6 +549,12 @@ def start_child_app(filename="bot.py"):
     base_filename = os.path.basename(clean_name)
     script_working_dir = os.path.dirname(full_path) or SCRIPTS_DIR
 
+    # Check if this script is already running
+    active_now = get_active_running_processes()
+    if clean_name in active_now:
+        pid = active_now[clean_name]["pid"]
+        return False, f"⚠️ <code>{clean_name}</code> is already running (PID: <code>{pid}</code>)."
+
     # Smart Auto-install: only if not already installed in current session
     req_path = get_script_req_path(clean_name)
     if req_path:
@@ -555,12 +568,8 @@ def start_child_app(filename="bot.py"):
             f"⚠️ <b>Reason:</b> <i>{abuse_reason}</i>\n\n"
             f"💡 <i>Remove suspicious mining / abuse code to run this script.</i>"
         )
-
-    if child_process and child_process.poll() is None:
-        stop_child_app(clear_active=False)
     
     try:
-        child_logs = []
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
         env["PYTHONPATH"] = f"{script_working_dir}:{SCRIPTS_DIR}:{WORKSPACE_DIR}:{env.get('PYTHONPATH', '')}"
@@ -593,11 +602,16 @@ def start_child_app(filename="bot.py"):
             cwd=script_working_dir, # Run in project directory!
             env=env
         )
-        child_process = proc
-        child_process_name = clean_name
-        child_process_start_time = time.time()
         
-        threading.Thread(target=log_stream_reader, args=(proc.stdout,), daemon=True).start()
+        running_processes[clean_name] = {
+            "proc": proc,
+            "start_time": time.time(),
+            "logs": [],
+            "is_stopped": False,
+            "pid": proc.pid
+        }
+        
+        threading.Thread(target=log_stream_reader, args=(proc.stdout, clean_name), daemon=True).start()
         threading.Thread(target=child_watchdog, args=(proc, clean_name), daemon=True).start()
         threading.Thread(target=resource_guard_monitor, args=(proc, clean_name), daemon=True).start()
         
@@ -606,11 +620,9 @@ def start_child_app(filename="bot.py"):
         
         poll_res = proc.poll()
         if poll_res is not None:
-            err_msg = "\n".join(child_logs) if child_logs else "(No output recorded)"
+            pdata = running_processes.pop(clean_name, {})
+            err_msg = "\n".join(pdata.get("logs", [])) if pdata.get("logs") else "(No output recorded)"
             missing_mod = extract_missing_module(err_msg)
-            child_process = None
-            child_process_name = None
-            child_process_start_time = None
             
             if missing_mod:
                 return False, (
@@ -625,64 +637,68 @@ def start_child_app(filename="bot.py"):
                 f"💡 <i>Tip: Use <b>Install Pip Package</b> if a dependency is missing.</i>"
             )
         
-        req_note = f" (📦 {os.path.basename(req_path)})" if req_path else " (📄 Standalone)"
-        config["active_script"] = clean_name
+        active_list = list(get_active_running_processes().keys())
+        config["active_scripts"] = active_list
         save_config(config)
-        return True, f"✨ <b>{clean_name}</b> started successfully!{req_note}\n🆔 Process ID: <code>{proc.pid}</code>\n🟢 State: Active (Running)"
+        
+        req_note = f" (📦 {os.path.basename(req_path)})" if req_path else " (📄 Standalone)"
+        return True, f"✨ <b>{clean_name}</b> started successfully!{req_note}\n🆔 PID: <code>{proc.pid}</code>\n🟢 <b>Active Scripts:</b> {len(active_list)} running concurrently"
     except Exception as e:
         return False, f"❌ Start error: {e}"
 
-def stop_child_app(clear_active=True):
-    global child_process, child_process_name, child_process_start_time, is_intentionally_stopped
-    is_intentionally_stopped = True
-    if clear_active:
-        config["active_script"] = None
-        save_config(config)
+def stop_child_app(script_name=None, clear_active=True):
+    """Stops a specific script or all running scripts."""
+    stopped_names = []
+    targets = [script_name] if script_name else list(running_processes.keys())
     
-    stopped_any = False
-    name = child_process_name or "bot.py"
-    
-    if child_process and child_process.poll() is None:
-        pid = child_process.pid
-        try:
-            parent = psutil.Process(pid)
-            children = parent.children(recursive=True)
-            for child in children:
+    for name in targets:
+        pdata = running_processes.get(name)
+        if pdata:
+            pdata["is_stopped"] = True
+            proc = pdata.get("proc")
+            if proc and proc.poll() is None:
+                pid = proc.pid
                 try:
-                    child.kill()
+                    parent = psutil.Process(pid)
+                    for child in parent.children(recursive=True):
+                        try:
+                            child.kill()
+                        except Exception:
+                            pass
+                    parent.kill()
                 except Exception:
-                    pass
-            parent.kill()
-            stopped_any = True
-        except Exception:
-            try:
-                child_process.kill()
-                stopped_any = True
-            except Exception:
-                pass
-        child_process = None
-        child_process_name = None
-        child_process_start_time = None
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                stopped_names.append(name)
+            running_processes.pop(name, None)
 
-    # Force kill any stray processes
-    for p in psutil.process_iter(['pid', 'name', 'cmdline']):
-        try:
-            cmd = " ".join(p.info.get('cmdline') or [])
-            if "scripts/" in cmd and p.pid != os.getpid():
-                p.kill()
-                stopped_any = True
-        except Exception:
-            pass
+    if clear_active:
+        active_list = list(get_active_running_processes().keys())
+        config["active_scripts"] = active_list
+        save_config(config)
 
-    if stopped_any:
-        return True, f"🛑 <b>{name}</b> has been stopped successfully."
+    if stopped_names:
+        if len(stopped_names) == 1:
+            return True, f"🛑 <b>{stopped_names[0]}</b> has been stopped successfully."
+        else:
+            return True, f"🛑 Stopped {len(stopped_names)} scripts: " + ", ".join([f"<code>{n}</code>" for n in stopped_names])
     return False, "ℹ️ No running script found to stop."
 
-def restart_child_app():
-    file_to_run = child_process_name or config.get("auto_run_file", "bot.py")
-    stop_child_app()
-    time.sleep(1)
-    return start_child_app(file_to_run)
+def restart_child_app(script_name=None):
+    active = get_active_running_processes()
+    if script_name:
+        stop_child_app(script_name=script_name, clear_active=False)
+        time.sleep(1)
+        return start_child_app(script_name)
+    elif active:
+        target = list(active.keys())[0]
+        stop_child_app(script_name=target, clear_active=False)
+        time.sleep(1)
+        return start_child_app(target)
+    else:
+        return start_child_app("bot.py")
 
 # ---------------------------------------------------------------------------
 # Self-Trigger: Next Runner Launch (Relay Handoff)
@@ -706,15 +722,20 @@ def trigger_next_runner():
 # Visual UI & Keyboards
 # ---------------------------------------------------------------------------
 def get_main_menu_keyboard():
-    is_alive = child_process and child_process.poll() is None
+    active = get_active_running_processes()
+    count = len(active)
     
-    if is_alive and child_process_name:
-        cu_sec = int(time.time() - child_process_start_time) if child_process_start_time else 0
+    if count == 1:
+        name = list(active.keys())[0]
+        pdata = active[name]
+        cu_sec = int(time.time() - pdata["start_time"])
         ch, cr = divmod(cu_sec, 3600)
         cm, _ = divmod(cr, 60)
-        status_btn = f"🟢 {child_process_name} ({ch}h {cm}m)"
+        status_btn = f"🟢 {name} ({ch}h {cm}m)"
+    elif count > 1:
+        status_btn = f"🟢 {count} Scripts Running"
     else:
-        status_btn = "🔴 Script: STOPPED"
+        status_btn = "🔴 All Scripts Stopped"
     
     ram = psutil.virtual_memory()
     cpu = psutil.cpu_percent(interval=None)
@@ -723,15 +744,15 @@ def get_main_menu_keyboard():
     return {
         "inline_keyboard": [
             [
-                {"text": status_btn, "callback_data": "menu_status"},
+                {"text": status_btn, "callback_data": "menu_runner"},
                 {"text": stats_btn, "callback_data": "menu_status"}
             ],
             [
                 {"text": "🚀 Scripts Runner", "callback_data": "menu_runner"},
-                {"text": "🛑 Stop Script", "callback_data": "menu_stop"}
+                {"text": f"🛑 Stop Script{'s' if count > 1 else ''}", "callback_data": "menu_stop"}
             ],
             [
-                {"text": "🔄 Restart Script", "callback_data": "menu_restart"},
+                {"text": "🔄 Restart", "callback_data": "menu_restart"},
                 {"text": "📋 Live Logs", "callback_data": "menu_logs"}
             ],
             [
@@ -762,31 +783,33 @@ def render_dashboard_text():
     minutes, seconds = divmod(remainder, 60)
     uptime_str = f"{hours}h {minutes}m {seconds}s"
     
-    is_alive = child_process and child_process.poll() is None
-    child_status = "🟢 Active (Running)" if is_alive else "🔴 Inactive (Stopped)"
+    active = get_active_running_processes()
+    count = len(active)
     
-    child_uptime_str = "N/A"
-    if is_alive and child_process_start_time:
-        cu_sec = int(time.time() - child_process_start_time)
-        ch, cr = divmod(cu_sec, 3600)
-        cm, cs = divmod(cr, 60)
-        child_uptime_str = f"{ch}h {cm}m {cs}s"
+    if count == 0:
+        script_status_lines = "• <b>Running Processes:</b> 🔴 <i>None (All Stopped / Standby)</i>"
+    else:
+        items = []
+        for name, pdata in sorted(active.items()):
+            cu_sec = int(time.time() - pdata["start_time"])
+            ch, cr = divmod(cu_sec, 3600)
+            cm, cs = divmod(cr, 60)
+            items.append(f"  └ 🟢 <code>{name}</code> (PID: <code>{pdata['pid']}</code> | Uptime: <code>{ch}h {cm}m {cs}s</code>)")
+        script_status_lines = f"• <b>Running Processes ({count} Active Concurrently):</b>\n" + "\n".join(items)
 
     ram = psutil.virtual_memory()
     cpu = psutil.cpu_percent(interval=None)
 
     status_text = (
-        f"⚡ <b>Cloud Server Dashboard</b>\n"
+        f"⚡ <b>Cloud Server Multi-Process Dashboard</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🖥️ <b>Server Host:</b> High-Speed Cloud Server (Linux)\n"
         f"⏱️ <b>Server Uptime:</b> {uptime_str}\n"
-        f"⚙️ <b>Active Script:</b> <code>{child_process_name or 'None'}</code>\n"
-        f"📊 <b>Script State:</b> {child_status}\n"
-        f"⏳ <b>Script Uptime:</b> {child_uptime_str}\n"
+        f"{script_status_lines}\n"
         f"💾 <b>RAM Usage:</b> {ram.percent}% ({ram.used // (1024*1024)}MB / {ram.total // (1024*1024)}MB)\n"
         f"📈 <b>CPU Load:</b> {cpu}%\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "💡 <i>Send any .py script or requirements.txt directly in chat to deploy!</i>"
+        "💡 <i>Multiple scripts can run in parallel concurrently 24/7!</i>"
     )
     return status_text
 
@@ -1308,32 +1331,30 @@ def prompt_runner_menu(chat_id, user_id, message_id=None):
                 all_files.append(rel)
     all_files.sort()
     
-    # Filter for runnable entry points (so database.py, models.py etc. don't get Run buttons)
     runnable_files = [f for f in all_files if is_runnable_entry_point(f)]
     if not runnable_files and all_files:
         runnable_files = all_files # Fallback if only 1 non-standard file exists
     
-    is_alive = child_process and child_process.poll() is None
+    active = get_active_running_processes()
     
     buttons = []
     if not runnable_files:
         text = (
-            "🚀 <b>Scripts Runner Manager</b>\n"
+            "🚀 <b>Scripts Runner Manager (Multi-Process)</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "📁 No runnable Python scripts found in <code>scripts/</code> folder.\n\n"
             "💡 <i>You can send any <code>.py</code> or <code>.zip</code> file in chat to add it!</i>"
         )
     else:
         text = (
-            "🚀 <b>Scripts Runner Manager</b>\n"
+            "🚀 <b>Scripts Runner Manager (Multi-Process)</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"• <b>Active Process:</b> {'🟢 ' + child_process_name if is_alive else '🔴 None (Stopped)'}\n"
-            f"• <b>Total Runnable Scripts:</b> {len(runnable_files)}\n\n"
-            "<i>Tap <b>▶️ Run</b> to execute or <b>🗑️ Delete</b> to remove:</i>"
+            f"• <b>Active Scripts:</b> {len(active)} Running Concurrently\n"
+            f"• <b>Total Scripts Available:</b> {len(runnable_files)}\n\n"
+            "<i>Tap <b>▶️ Run</b> to launch in parallel or <b>🛑 Stop</b> to terminate:</i>"
         )
         for py in runnable_files:
-            is_this_running = is_alive and child_process_name == py
-            
+            is_this_running = py in active
             req_p = get_script_req_path(py)
             has_env = len(read_script_env(py)) > 0
             
@@ -1345,7 +1366,11 @@ def prompt_runner_menu(chat_id, user_id, message_id=None):
             badge_str = f" {' '.join(badges)}" if badges else ""
             
             if is_this_running:
-                run_btn = {"text": f"🛑 Stop {py}{badge_str}", "callback_data": "menu_stop"}
+                pdata = active[py]
+                cu_sec = int(time.time() - pdata["start_time"])
+                ch, cr = divmod(cu_sec, 3600)
+                cm, _ = divmod(cr, 60)
+                run_btn = {"text": f"🛑 Stop {py} ({ch}h {cm}m){badge_str}", "callback_data": f"confirm_stop_prompt_{py}"}
             else:
                 run_btn = {"text": f"▶️ Run {py}{badge_str}", "callback_data": f"exec_run_{py}"}
             
@@ -1353,8 +1378,8 @@ def prompt_runner_menu(chat_id, user_id, message_id=None):
             buttons.append([run_btn, del_btn])
 
     buttons.append([{"text": "📤 Upload New Script / ZIP", "callback_data": "menu_upload_prompt"}])
-    if is_alive:
-        buttons.append([{"text": "🛑 Stop Current Script", "callback_data": "menu_stop"}])
+    if len(active) > 1:
+        buttons.append([{"text": "🛑 Stop ALL Running Scripts", "callback_data": "menu_stop_all"}])
     buttons.append([{"text": "🔙 Main Menu", "callback_data": "menu_main"}])
 
     markup = {"inline_keyboard": buttons}
@@ -1400,31 +1425,61 @@ def prompt_sh_menu(chat_id, user_id, message_id=None):
     else:
         send_tg_message(chat_id, text, reply_markup=markup)
 
-def show_logs_view(chat_id, message_id=None):
-    is_alive = child_process and child_process.poll() is None
-    status_header = f"🟢 <code>{child_process_name}</code> (Running)" if is_alive else f"🔴 <code>{child_process_name or 'None'}</code> (Stopped)"
+def show_logs_view(chat_id, message_id=None, target_script=None):
+    active = get_active_running_processes()
     
-    if not child_logs:
-        log_text = "<i>No logs recorded yet. Start a script to see live output.</i>"
-    else:
-        recent = "\n".join(child_logs[-30:])
-        escaped_recent = html.escape(recent)
-        log_text = f"<pre>{escaped_recent}</pre>"
-    
-    text = (
-        "📋 <b>Live Execution Logs</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"• <b>Status:</b> {status_header}\n"
-        f"• <b>Total Logs in Buffer:</b> {len(child_logs)} lines\n\n"
-        f"{log_text}"
-    )
-    markup = {
-        "inline_keyboard": [
-            [{"text": "🔄 Refresh Logs", "callback_data": "menu_logs"}],
-            [{"text": "🛑 Stop Script", "callback_data": "menu_stop"}, {"text": "🔄 Restart", "callback_data": "menu_restart"}],
-            [{"text": "🔙 Main Menu", "callback_data": "menu_main"}]
+    if not active:
+        text = (
+            "📋 <b>Live Execution Logs</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "ℹ️ <i>No scripts are currently running. Start a script to view live output.</i>"
+        )
+        markup = {
+            "inline_keyboard": [
+                [{"text": "🚀 Scripts Runner", "callback_data": "menu_runner"}],
+                [{"text": "🔙 Main Menu", "callback_data": "menu_main"}]
+            ]
+        }
+    elif len(active) == 1 or target_script:
+        selected_script = target_script if target_script and target_script in running_processes else list(active.keys())[0]
+        pdata = running_processes.get(selected_script, {})
+        logs = pdata.get("logs", [])
+        
+        if not logs:
+            log_text = "<i>(Process initialized, waiting for output...)</i>"
+        else:
+            recent = "\n".join(logs[-30:])
+            log_text = f"<pre>{html.escape(recent)}</pre>"
+            
+        text = (
+            f"📋 <b>Live Execution Logs:</b> <code>{selected_script}</code>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"• <b>PID:</b> <code>{pdata.get('pid', 'N/A')}</code>\n"
+            f"• <b>Total Logs in Buffer:</b> {len(logs)} lines\n\n"
+            f"{log_text}"
+        )
+        buttons = [
+            [{"text": "🔄 Refresh Logs", "callback_data": f"show_log_for_{selected_script}"}],
+            [{"text": f"🛑 Stop {selected_script}", "callback_data": f"confirm_stop_prompt_{selected_script}"}, {"text": "🚀 Runner", "callback_data": "menu_runner"}]
         ]
-    }
+        if len(active) > 1:
+            buttons.append([{"text": "📑 Switch Script Logs", "callback_data": "menu_logs_select"}])
+        buttons.append([{"text": "🔙 Main Menu", "callback_data": "menu_main"}])
+        markup = {"inline_keyboard": buttons}
+    else:
+        # Multiple scripts running: show selector
+        text = (
+            "📋 <b>Live Execution Logs (Multi-Process)</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Multiple scripts are currently active ({len(active)} running in parallel).\n\n"
+            "<i>Select a script below to view its live logs:</i>"
+        )
+        buttons = []
+        for sname in sorted(active.keys()):
+            buttons.append([{"text": f"📄 Logs: {sname}", "callback_data": f"show_log_for_{sname}"}])
+        buttons.append([{"text": "🔙 Main Menu", "callback_data": "menu_main"}])
+        markup = {"inline_keyboard": buttons}
+
     if message_id:
         edit_tg_message(chat_id, message_id, text, reply_markup=markup)
     else:
@@ -1433,7 +1488,7 @@ def show_logs_view(chat_id, message_id=None):
 def show_files_view(chat_id, message_id=None):
     os.makedirs(SCRIPTS_DIR, exist_ok=True)
     top_items = sorted([f for f in os.listdir(SCRIPTS_DIR) if not f.startswith(".") and f != "__pycache__"])
-    is_alive = child_process and child_process.poll() is None
+    active = get_active_running_processes()
     
     file_lines = []
     download_buttons = []
@@ -1455,7 +1510,8 @@ def show_files_view(chat_id, message_id=None):
                             inner_files.append(os.path.relpath(fp, SCRIPTS_DIR))
                 
                 # Check if process is running inside this project
-                is_this_running = is_alive and child_process_name and (child_process_name.startswith(f"{it}/") or child_process_name == it)
+                is_this_running = any(k.startswith(f"{it}/") or k == it for k in active.keys())
+                running_script_name = next((k for k in active.keys() if k.startswith(f"{it}/") or k == it), None)
                 status_icon = "🟢" if is_this_running else "📦"
                 
                 # Detect entry script for Run button
@@ -1477,8 +1533,8 @@ def show_files_view(chat_id, message_id=None):
                 file_lines.append(f"• {status_icon} <b>{it}/</b> [Project Archive]{badge_str}{' <b>[RUNNING]</b>' if is_this_running else ''}")
                 
                 row_btns = [{"text": f"📥 {it}.zip", "callback_data": f"file_dl_{it}"}]
-                if is_this_running:
-                    row_btns.append({"text": "🛑 Stop", "callback_data": "menu_stop"})
+                if is_this_running and running_script_name:
+                    row_btns.append({"text": "🛑 Stop", "callback_data": f"confirm_stop_prompt_{running_script_name}"})
                 elif entry_script:
                     row_btns.append({"text": "▶️ Run", "callback_data": f"exec_run_{entry_script}"})
                 row_btns.append({"text": "🗑️ Delete", "callback_data": f"file_del_{it}"})
@@ -1486,7 +1542,7 @@ def show_files_view(chat_id, message_id=None):
                 
             elif os.path.isfile(p):
                 sz = os.path.getsize(p)
-                is_this_running = is_alive and child_process_name == it
+                is_this_running = it in active
                 status_icon = "🟢" if is_this_running else "📄"
                 
                 if it.endswith(".py"):
@@ -1506,7 +1562,7 @@ def show_files_view(chat_id, message_id=None):
                     
                     row_btns = [{"text": f"📥 {it}", "callback_data": f"file_dl_{it}"}]
                     if is_this_running:
-                        row_btns.append({"text": "🛑 Stop", "callback_data": "menu_stop"})
+                        row_btns.append({"text": "🛑 Stop", "callback_data": f"confirm_stop_prompt_{it}"})
                     elif is_runnable:
                         row_btns.append({"text": "▶️ Run", "callback_data": f"exec_run_{it}"})
                     row_btns.append({"text": "🗑️ Delete", "callback_data": f"file_del_{it}"})
@@ -1522,7 +1578,8 @@ def show_files_view(chat_id, message_id=None):
         "📂 <b>Scripts File Manager</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📁 <b>Directory:</b> <code>scripts/</code> (Cloud Storage)\n"
-        f"📊 <b>Total Items:</b> {len(top_items)}\n\n"
+        f"📊 <b>Total Items:</b> {len(top_items)}\n"
+        f"🟢 <b>Active Running:</b> {len(active)}\n\n"
         + "\n".join(file_lines[:40])
         + ("\n<i>...and more items</i>" if len(file_lines) > 40 else "")
         + "\n\n<i>Tap a button below to Download, Run, or Delete:</i>"
@@ -1540,29 +1597,27 @@ def show_files_view(chat_id, message_id=None):
         send_tg_message(chat_id, text, reply_markup=markup)
 
 def prompt_stop_menu(chat_id, user_id, message_id=None):
-    is_alive = child_process and child_process.poll() is None
-    if not is_alive or not child_process_name:
-        text = "ℹ️ <b>No Running Scripts</b>\n\nThere is no script currently running."
+    active = get_active_running_processes()
+    if not active:
+        text = "ℹ️ <b>No Running Scripts</b>\n\nThere are no scripts currently running."
         markup = {"inline_keyboard": [[{"text": "🔙 Main Menu", "callback_data": "menu_main"}]]}
     else:
-        cu_sec = int(time.time() - child_process_start_time) if child_process_start_time else 0
-        ch, cr = divmod(cu_sec, 3600)
-        cm, cs = divmod(cr, 60)
-        
         text = (
-            "🛑 <b>Running Scripts Manager</b>\n"
+            f"🛑 <b>Running Scripts Manager ({len(active)} Active)</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"• <b>Active Script:</b> <code>{child_process_name}</code>\n"
-            f"• <b>PID:</b> <code>{child_process.pid}</code>\n"
-            f"• <b>Uptime:</b> {ch}h {cm}m {cs}s\n\n"
-            "<i>Confirm termination below:</i>"
+            "<i>Select a script below to terminate it:</i>"
         )
-        markup = {
-            "inline_keyboard": [
-                [{"text": f"🛑 Stop {child_process_name}", "callback_data": f"confirm_stop_prompt_{child_process_name}"}],
-                [{"text": "🔙 Main Menu", "callback_data": "menu_main"}]
-            ]
-        }
+        buttons = []
+        for name, pdata in sorted(active.items()):
+            cu_sec = int(time.time() - pdata["start_time"])
+            ch, cr = divmod(cu_sec, 3600)
+            cm, cs = divmod(cr, 60)
+            buttons.append([{"text": f"🛑 Stop {name} ({ch}h {cm}m | PID: {pdata['pid']})", "callback_data": f"confirm_stop_prompt_{name}"}])
+        if len(active) > 1:
+            buttons.append([{"text": "🛑 Stop ALL Running Scripts", "callback_data": "menu_stop_all"}])
+        buttons.append([{"text": "🔙 Main Menu", "callback_data": "menu_main"}])
+        markup = {"inline_keyboard": buttons}
+        
     if message_id:
         edit_tg_message(chat_id, message_id, text, reply_markup=markup)
     else:
@@ -1592,8 +1647,12 @@ def show_server_info_view(chat_id, message_id=None):
     rh, rr = divmod(relay_remain, 3600)
     rm, rs = divmod(rr, 60)
     
-    is_alive = child_process and child_process.poll() is None
-    active_name = child_process_name if is_alive else (config.get("active_script") or "None (Standby)")
+    active = get_active_running_processes()
+    count = len(active)
+    if count == 0:
+        active_summary = "🔴 <i>None (Stopped / Standby)</i>"
+    else:
+        active_summary = f"🟢 <b>{count} Active:</b> " + ", ".join([f"<code>{s}</code>" for s in sorted(active.keys())])
     
     repo_name = repo_info.get("full_name", REPO)
     visibility = "🌍 Public" if not repo_info.get("private", False) else "🔒 Private"
@@ -1615,7 +1674,7 @@ def show_server_info_view(chat_id, message_id=None):
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "⚡ <b>Live Relay Server Status:</b>\n"
         f"• <b>Daemon Status:</b> 🟢 <b>Active & Healthy</b>\n"
-        f"• <b>Active Script:</b> {'🟢 <code>' + active_name + '</code>' if is_alive else '🔴 <i>Stopped / Standby</i>'}\n"
+        f"• <b>Active Scripts:</b> {active_summary}\n"
         f"• <b>Current Run ID:</b> <code>#{RUN_ID}</code>\n"
         f"• <b>Current Phase Uptime:</b> <code>{hours}h {minutes}m {seconds}s</code>\n"
         f"• <b>Next Relay Handoff In:</b> <code>{rh}h {rm}m {rs}s</code> (Auto-Resuming)\n"
@@ -1782,9 +1841,15 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
     # 5c. Do Stop Execution
     elif data.startswith("do_stop_"):
         fname = data.replace("do_stop_", "")
-        ok, msg = stop_child_app()
+        ok, msg = stop_child_app(script_name=fname)
         answer_callback(callback_id, f"{fname} stopped!", show_alert=True)
         edit_tg_message(chat_id, message_id, f"🛑 <b>{fname} has been stopped successfully!</b>", reply_markup=get_main_menu_keyboard())
+
+    # 5d. Stop All Scripts Execution
+    elif data == "menu_stop_all":
+        answer_callback(callback_id, "Stopping all scripts...")
+        stop_child_app(script_name=None, clear_active=True)
+        send_tg_message(chat_id, "🛑 <b>All running scripts have been stopped.</b>", reply_markup=get_main_menu_keyboard())
 
     # 6. Restart Script
     elif data == "menu_restart":
@@ -1794,6 +1859,17 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
 
     # 7. Logs
     elif data == "menu_logs":
+        answer_callback(callback_id)
+        show_logs_view(chat_id, message_id)
+
+    # 7b. Specific Script Logs
+    elif data.startswith("show_log_for_"):
+        fname = data.replace("show_log_for_", "")
+        answer_callback(callback_id, f"Loading {fname} logs...")
+        show_logs_view(chat_id, message_id, target_script=fname)
+
+    # 7c. Select Script Logs
+    elif data == "menu_logs_select":
         answer_callback(callback_id)
         show_logs_view(chat_id, message_id)
 
@@ -2228,16 +2304,25 @@ def main():
     # Restore all private environments from encoded vault (100% safe from secret scanner!)
     restore_all_env_vaults_on_boot()
     
-    # Seamless Relay Persistence: If a script was actively running before handoff, resume it!
-    last_active = config.get("active_script")
-    if last_active:
-        logger.info(f"🔄 Auto-resuming active script across relay handoff: {last_active}")
-        def delayed_resume(script_to_run):
+    # Seamless Multi-Script Relay Persistence: Auto-resume all active scripts!
+    active_list = config.get("active_scripts", [])
+    if not active_list and config.get("active_script"):
+        active_list = [config["active_script"]]
+
+    if active_list:
+        logger.info(f"🔄 Auto-resuming {len(active_list)} active scripts across relay handoff: {active_list}")
+        def delayed_multi_resume(scripts_to_run):
             time.sleep(2.0)
-            notify_all_admins(f"🔄 <b>New Relay Phase Active:</b>\nAuto-resuming <code>{script_to_run}</code>...")
-            ok_res, res_msg = start_child_app(script_to_run)
-            notify_all_admins(res_msg, reply_markup=get_main_menu_keyboard())
-        threading.Thread(target=delayed_resume, args=(last_active,), daemon=True).start()
+            notify_all_admins(
+                f"🔄 <b>New Relay Phase Active:</b>\n"
+                f"Auto-resuming {len(scripts_to_run)} scripts in parallel:\n"
+                + "\n".join([f"• <code>{s}</code>" for s in scripts_to_run])
+            )
+            for s in scripts_to_run:
+                start_child_app(s)
+                time.sleep(0.5)
+            notify_all_admins("🟢 <b>All persistent scripts are now running!</b>", reply_markup=get_main_menu_keyboard())
+        threading.Thread(target=delayed_multi_resume, args=(active_list,), daemon=True).start()
 
     # Start Telegram polling thread
     tg_thread = threading.Thread(target=telegram_polling_loop, daemon=True, name="TGPolling")
@@ -2254,18 +2339,21 @@ def main():
     # --- HANDOFF SEQUENCE ---
     IS_RUNNING = False # Stop Telegram polling immediately on old runner
     
-    active_to_persist = child_process_name or config.get("active_script")
-    if active_to_persist:
-        config["active_script"] = active_to_persist
-        save_config(config)
+    active_now = list(get_active_running_processes().keys())
+    config["active_scripts"] = active_now
+    save_config(config)
+    
+    resume_note = ""
+    if active_now:
+        resume_note = f"\n🚀 <i>{len(active_now)} active scripts will auto-resume in new phase:</i>\n" + "\n".join([f"• <code>{s}</code>" for s in active_now])
     
     notify_all_admins(
         "🔄 <b>Relay Transition (5.5 Hours):</b>\n"
-        "Backing up workspace and transitioning to next runner...\n"
-        + (f"🚀 <i><code>{active_to_persist}</code> will automatically resume in new phase!</i>" if active_to_persist else "")
+        "Backing up workspace and transitioning to next runner..."
+        + resume_note
     )
     
-    stop_child_app(clear_active=False) # Stop process on old runner without erasing active_script!
+    stop_child_app(script_name=None, clear_active=False) # Stop processes without erasing active_scripts list!
     git_sync_to_github("Auto-backup before Relay Handoff")
     trigger_next_runner()
     time.sleep(5)
