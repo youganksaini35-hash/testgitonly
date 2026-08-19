@@ -25,8 +25,8 @@ logger = logging.getLogger("TGBotController")
 # ---------------------------------------------------------------------------
 # Configuration & Environment Variables
 # ---------------------------------------------------------------------------
-TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "8371551028:AAHOHLLq8TZrp8axx9NqQCZXDvcni5f_cnU")
-GH_PAT = os.environ.get("GH_PAT", os.environ.get("GITHUB_TOKEN", ""))
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
+GH_PAT = os.environ.get("GH_PAT", os.environ.get("GITHUB_TOKEN", "")).strip()
 REPO = os.environ.get("GITHUB_REPOSITORY", "youganksaini35-hash/testgitonly")
 RUN_ID = os.environ.get("GITHUB_RUN_ID", "local-dev")
 WORKFLOW_FILE = os.environ.get("WORKFLOW_FILE", "server.yml")
@@ -2219,6 +2219,11 @@ def main():
     logger.info("=" * 60)
     logger.info(f"🚀 Telegram Relay Controller Initialized [Run #{RUN_ID}]")
     logger.info("=" * 60)
+    
+    if not TG_BOT_TOKEN:
+        logger.error("❌ CRITICAL: TG_BOT_TOKEN is missing! Please configure TG_BOT_TOKEN in GitHub Repository Secrets.")
+        time.sleep(10)
+        return
     
     # Restore all private environments from encoded vault (100% safe from secret scanner!)
     restore_all_env_vaults_on_boot()
