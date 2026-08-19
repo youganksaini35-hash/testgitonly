@@ -557,7 +557,7 @@ def start_child_app(filename="bot.py"):
         )
 
     if child_process and child_process.poll() is None:
-        stop_child_app()
+        stop_child_app(clear_active=False)
     
     try:
         child_logs = []
@@ -626,17 +626,18 @@ def start_child_app(filename="bot.py"):
             )
         
         req_note = f" (📦 {os.path.basename(req_path)})" if req_path else " (📄 Standalone)"
-        config["active_script"] = base_filename
+        config["active_script"] = clean_name
         save_config(config)
-        return True, f"✨ <b>{base_filename}</b> started successfully!{req_note}\n🆔 Process ID: <code>{proc.pid}</code>\n🟢 State: Active (Running)"
+        return True, f"✨ <b>{clean_name}</b> started successfully!{req_note}\n🆔 Process ID: <code>{proc.pid}</code>\n🟢 State: Active (Running)"
     except Exception as e:
         return False, f"❌ Start error: {e}"
 
-def stop_child_app():
+def stop_child_app(clear_active=True):
     global child_process, child_process_name, child_process_start_time, is_intentionally_stopped
     is_intentionally_stopped = True
-    config["active_script"] = None
-    save_config(config)
+    if clear_active:
+        config["active_script"] = None
+        save_config(config)
     
     stopped_any = False
     name = child_process_name or "bot.py"
@@ -1917,7 +1918,12 @@ def main():
     last_active = config.get("active_script")
     if last_active:
         logger.info(f"🔄 Auto-resuming active script across relay handoff: {last_active}")
-        threading.Thread(target=start_child_app, args=(last_active,), daemon=True).start()
+        def delayed_resume(script_to_run):
+            time.sleep(2.0)
+            notify_all_admins(f"🔄 <b>New Relay Phase Active:</b>\nAuto-resuming <code>{script_to_run}</code>...")
+            ok_res, res_msg = start_child_app(script_to_run)
+            notify_all_admins(res_msg, reply_markup=get_main_menu_keyboard())
+        threading.Thread(target=delayed_resume, args=(last_active,), daemon=True).start()
 
     # Start Telegram polling thread
     tg_thread = threading.Thread(target=telegram_polling_loop, daemon=True, name="TGPolling")
@@ -1934,12 +1940,18 @@ def main():
     # --- HANDOFF SEQUENCE ---
     IS_RUNNING = False # Stop Telegram polling immediately on old runner
     
+    active_to_persist = child_process_name or config.get("active_script")
+    if active_to_persist:
+        config["active_script"] = active_to_persist
+        save_config(config)
+    
     notify_all_admins(
-        "🔄 <b>5.5 Hours Relay Limit Reached:</b>\n"
-        "Backing up workspace and transitioning to next runner..."
+        "🔄 <b>Relay Transition (5.5 Hours):</b>\n"
+        "Backing up workspace and transitioning to next runner...\n"
+        + (f"🚀 <i><code>{active_to_persist}</code> will automatically resume in new phase!</i>" if active_to_persist else "")
     )
     
-    stop_child_app()
+    stop_child_app(clear_active=False) # Stop process on old runner without erasing active_script!
     git_sync_to_github("Auto-backup before Relay Handoff")
     trigger_next_runner()
     time.sleep(5)
