@@ -1431,24 +1431,59 @@ def show_logs_view(chat_id, message_id=None):
 
 def show_files_view(chat_id, message_id=None):
     os.makedirs(SCRIPTS_DIR, exist_ok=True)
-    files = []
-    for root, _, fs in os.walk(SCRIPTS_DIR):
-        for f in fs:
-            if not f.startswith(".") and f != "__pycache__":
-                rel = os.path.relpath(os.path.join(root, f), SCRIPTS_DIR)
-                files.append(rel)
-    files.sort()
+    top_items = sorted([f for f in os.listdir(SCRIPTS_DIR) if not f.startswith(".") and f != "__pycache__"])
     is_alive = child_process and child_process.poll() is None
     
     file_lines = []
     download_buttons = []
     
-    if not files:
+    if not top_items:
         file_lines.append("<i>Scripts folder (scripts/) is currently empty.\nSend any .py script, .env, or .zip archive to upload!</i>")
     else:
-        for it in files:
+        for it in top_items:
             p = os.path.join(SCRIPTS_DIR, it)
-            if os.path.isfile(p):
+            if os.path.isdir(p):
+                # It's a Project Archive / Directory!
+                inner_files = []
+                total_size = 0
+                for root, _, fs in os.walk(p):
+                    for f in fs:
+                        if not f.startswith(".") and f != "__pycache__":
+                            fp = os.path.join(root, f)
+                            total_size += os.path.getsize(fp)
+                            inner_files.append(os.path.relpath(fp, SCRIPTS_DIR))
+                
+                # Check if process is running inside this project
+                is_this_running = is_alive and child_process_name and (child_process_name.startswith(f"{it}/") or child_process_name == it)
+                status_icon = "🟢" if is_this_running else "📦"
+                
+                # Detect entry script for Run button
+                entry_script = None
+                for candidate in ["main.py", "bot.py", "app.py", "run.py", "start.py", "server.py"]:
+                    for rel in inner_files:
+                        if os.path.basename(rel).lower() == candidate:
+                            entry_script = rel
+                            break
+                    if entry_script:
+                        break
+                if not entry_script:
+                    for rel in inner_files:
+                        if rel.endswith(".py") and is_runnable_entry_point(rel):
+                            entry_script = rel
+                            break
+                            
+                badge_str = f" <i>(📁 {len(inner_files)} files | {total_size} bytes)</i>"
+                file_lines.append(f"• {status_icon} <b>{it}/</b> [Project Archive]{badge_str}{' <b>[RUNNING]</b>' if is_this_running else ''}")
+                
+                row_btns = [{"text": f"📥 {it}.zip", "callback_data": f"file_dl_{it}"}]
+                if is_this_running:
+                    row_btns.append({"text": "🛑 Stop", "callback_data": "menu_stop"})
+                elif entry_script:
+                    row_btns.append({"text": "▶️ Run", "callback_data": f"exec_run_{entry_script}"})
+                row_btns.append({"text": "🗑️ Delete", "callback_data": f"file_del_{it}"})
+                download_buttons.append(row_btns)
+                
+            elif os.path.isfile(p):
                 sz = os.path.getsize(p)
                 is_this_running = is_alive and child_process_name == it
                 status_icon = "🟢" if is_this_running else "📄"
@@ -1486,13 +1521,15 @@ def show_files_view(chat_id, message_id=None):
         "📂 <b>Scripts File Manager</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📁 <b>Directory:</b> <code>scripts/</code> (Cloud Storage)\n"
-        f"📊 <b>Total Files:</b> {len(files)}\n\n"
+        f"📊 <b>Total Items:</b> {len(top_items)}\n\n"
         + "\n".join(file_lines[:40])
-        + ("\n<i>...and more files</i>" if len(file_lines) > 40 else "")
+        + ("\n<i>...and more items</i>" if len(file_lines) > 40 else "")
         + "\n\n<i>Tap a button below to Download, Run, or Delete:</i>"
     )
-    download_buttons.append([{"text": "🚀 Scripts Runner", "callback_data": "menu_runner"}])
     download_buttons.append([{"text": "📤 Upload New Script / ZIP", "callback_data": "menu_upload_prompt"}])
+    download_buttons.append([{"text": "🚀 Scripts Runner", "callback_data": "menu_runner"}])
+    if top_items:
+        download_buttons.append([{"text": "💣 Delete All Scripts & Projects", "callback_data": "file_del_all_prompt"}])
     download_buttons.append([{"text": "🔙 Main Menu", "callback_data": "menu_main"}])
     markup = {"inline_keyboard": download_buttons[:90]} # Keep under TG inline keyboard limit
     
@@ -1687,26 +1724,36 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
         answer_callback(callback_id)
         show_files_view(chat_id, message_id)
 
-    # 9. Download File
+    # 9. Download File / Project Archive
     elif data.startswith("file_dl_"):
         fname = data.replace("file_dl_", "")
-        if os.path.exists(os.path.join(SCRIPTS_DIR, fname)):
-            fpath = os.path.join(SCRIPTS_DIR, fname)
-        else:
-            fpath = os.path.join(WORKSPACE_DIR, fname)
+        target_path = os.path.join(SCRIPTS_DIR, fname)
+        if not os.path.exists(target_path):
+            target_path = os.path.join(WORKSPACE_DIR, fname)
 
-        if os.path.exists(fpath):
-            answer_callback(callback_id, f"Sending {fname}...")
-            send_tg_document(chat_id, fpath, caption=f"📄 <b>{fname}</b>")
+        if os.path.exists(target_path):
+            if os.path.isdir(target_path):
+                import shutil
+                answer_callback(callback_id, f"Archiving {fname} to ZIP...")
+                zip_base = os.path.join(WORKSPACE_DIR, f"temp_{fname}")
+                zip_path = shutil.make_archive(zip_base, 'zip', target_path)
+                send_tg_document(chat_id, zip_path, caption=f"📦 <b>Project Archive:</b> <code>{fname}.zip</code>")
+                try:
+                    os.remove(zip_path)
+                except Exception:
+                    pass
+            else:
+                answer_callback(callback_id, f"Sending {fname}...")
+                send_tg_document(chat_id, target_path, caption=f"📄 <code>{fname}</code>")
         else:
             answer_callback(callback_id, "File not found!", show_alert=True)
 
-    # 10. Delete File Prompt (Confirmation)
+    # 10. Delete File/Folder Prompt (Confirmation)
     elif data.startswith("file_del_"):
         fname = data.replace("file_del_", "")
         answer_callback(callback_id)
         text = (
-            f"⚠️ <b>Confirm File Deletion</b>\n"
+            f"⚠️ <b>Confirm Deletion</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             f"Are you sure you want to permanently delete <code>scripts/{fname}</code>?"
         )
@@ -1718,21 +1765,64 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
         }
         edit_tg_message(chat_id, message_id, text, reply_markup=markup)
 
-    # 10b. Do Delete File Execution
+    # 10b. Do Delete File/Folder Execution
     elif data.startswith("do_delete_file_"):
         fname = data.replace("do_delete_file_", "")
-        if os.path.exists(os.path.join(SCRIPTS_DIR, fname)):
-            fpath = os.path.join(SCRIPTS_DIR, fname)
-        else:
-            fpath = os.path.join(WORKSPACE_DIR, fname)
+        target_path = os.path.join(SCRIPTS_DIR, fname)
+        if not os.path.exists(target_path):
+            target_path = os.path.join(WORKSPACE_DIR, fname)
 
-        if os.path.exists(fpath):
-            os.remove(fpath)
+        if os.path.exists(target_path):
+            import shutil
+            if os.path.isdir(target_path):
+                shutil.rmtree(target_path)
+            else:
+                os.remove(target_path)
             git_sync_to_github(f"Deleted scripts/{fname} via Telegram")
             answer_callback(callback_id, f"{fname} deleted!", show_alert=True)
             show_files_view(chat_id, message_id)
         else:
             answer_callback(callback_id, "File not found!", show_alert=True)
+
+    # 10c. Delete All Files Prompt
+    elif data == "file_del_all_prompt":
+        answer_callback(callback_id)
+        text = (
+            "💣 <b>Confirm Complete Workspace Wipe</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "⚠️ <b>WARNING:</b> This will permanently delete <b>ALL scripts, ZIP archives, and project files</b> in <code>scripts/</code>!\n\n"
+            "🔴 <i>Any actively running script will be stopped.</i>\n\n"
+            "Are you absolutely sure?"
+        )
+        markup = {
+            "inline_keyboard": [
+                [{"text": "💣 Yes, Delete Everything", "callback_data": "do_delete_all_files"}],
+                [{"text": "❌ Cancel", "callback_data": "menu_files"}]
+            ]
+        }
+        edit_tg_message(chat_id, message_id, text, reply_markup=markup)
+
+    # 10d. Do Delete All Files Execution
+    elif data == "do_delete_all_files":
+        import shutil
+        answer_callback(callback_id, "Wiping workspace...")
+        stop_child_app(clear_active=True)
+        try:
+            for it in os.listdir(SCRIPTS_DIR):
+                if it != ".gitkeep":
+                    ip = os.path.join(SCRIPTS_DIR, it)
+                    if os.path.isdir(ip):
+                        shutil.rmtree(ip)
+                    else:
+                        os.remove(ip)
+        except Exception as e:
+            logger.error(f"Error wiping scripts dir: {e}")
+        config["active_script"] = None
+        config["env_vault"] = {}
+        save_config(config)
+        git_sync_to_github("Wipe all scripts via Telegram")
+        send_tg_message(chat_id, "✅ <b>Workspace Wiped!</b> All scripts and project archives have been permanently deleted.")
+        show_files_view(chat_id, message_id)
 
     # 11. Pip prompt
     elif data == "menu_pip_prompt":
