@@ -769,7 +769,7 @@ def get_main_menu_keyboard():
             ],
             [
                 {"text": "💾 Cloud Sync", "callback_data": "menu_sync"},
-                {"text": "ℹ️ Server & Repo Info", "callback_data": "menu_server_info"}
+                {"text": "ℹ️ Server Info", "callback_data": "menu_server_info"}
             ]
         ]
     }
