@@ -2361,26 +2361,28 @@ def main():
     # Restore all private environments from encoded vault (100% safe from secret scanner!)
     restore_all_env_vaults_on_boot()
     
-    # Seamless Multi-Script Relay Persistence: Auto-resume all active scripts!
-    active_list = config.get("active_scripts", [])
-    if not active_list and config.get("active_script"):
-        active_list = [config["active_script"]]
-
-    # Auto-recovery fallback: If active_list is empty, check vault configured scripts or all runnable entry points
-    if not active_list:
-        vault_scripts = list(config.get("env_vault", {}).keys())
-        for s in vault_scripts:
-            sp = os.path.join(SCRIPTS_DIR, s)
-            if os.path.exists(sp) and s not in active_list:
-                active_list.append(s)
-
-    if not active_list:
-        for root, _, fs in os.walk(SCRIPTS_DIR):
-            for f in fs:
-                if f.endswith(".py") and not f.startswith("."):
-                    rel = os.path.relpath(os.path.join(root, f), SCRIPTS_DIR)
-                    if is_runnable_entry_point(rel) and rel not in active_list:
-                        active_list.append(rel)
+    # Seamless Multi-Script Relay Persistence: Auto-resume active scripts
+    active_list = config.get("active_scripts")
+    
+    # If active_scripts was never initialized in config (first boot), look for candidates
+    if active_list is None:
+        active_list = []
+        if config.get("active_script"):
+            active_list = [config["active_script"]]
+        else:
+            vault_scripts = list(config.get("env_vault", {}).keys())
+            for s in vault_scripts:
+                sp = os.path.join(SCRIPTS_DIR, s)
+                if os.path.exists(sp) and s not in active_list:
+                    active_list.append(s)
+            if not active_list:
+                for root, _, fs in os.walk(SCRIPTS_DIR):
+                    for f in fs:
+                        if f.endswith(".py") and not f.startswith("."):
+                            rel = os.path.relpath(os.path.join(root, f), SCRIPTS_DIR)
+                            if is_runnable_entry_point(rel) and rel not in active_list:
+                                active_list.append(rel)
+                                break
 
     if active_list:
         logger.info(f"🔄 Auto-resuming {len(active_list)} active scripts across relay handoff/boot: {active_list}")
