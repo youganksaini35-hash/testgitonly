@@ -1,0 +1,8 @@
+# Ignore plain-text environment files to prevent GitHub Secret Scanner revocation
+*.env
+.env
+scripts/**/.env
+scripts/**/*.env
+__pycache__/
+*.pyc
+.pytest_cache/
