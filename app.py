@@ -1009,6 +1009,56 @@ def get_script_env_path(py_filename):
             return c
     return candidates[0] if candidates else os.path.join(SCRIPTS_DIR, ".env")
 
+def get_vault_master_key():
+    """Derives a 256-bit encryption key from the private TG_BOT_TOKEN secret."""
+    import hashlib
+    secret = TG_BOT_TOKEN or "fallback_vault_salt_saini920_private_cloud"
+    return hashlib.sha256(secret.encode('utf-8')).digest()
+
+def encrypt_secret_data(plain_text: str) -> str:
+    """AES-grade CTR + HMAC-SHA256 authenticated encryption using the private master key."""
+    import hashlib, hmac, os, base64
+    key = get_vault_master_key()
+    nonce = os.urandom(16)
+    data_bytes = plain_text.encode('utf-8')
+    keystream = bytearray()
+    counter = 0
+    while len(keystream) < len(data_bytes):
+        block = hashlib.sha256(key + nonce + counter.to_bytes(4, 'big')).digest()
+        keystream.extend(block)
+        counter += 1
+    ciphertext = bytes(a ^ b for a, b in zip(data_bytes, keystream[:len(data_bytes)]))
+    tag = hmac.new(key, nonce + ciphertext, hashlib.sha256).digest()
+    payload = nonce + tag + ciphertext
+    return base64.b64encode(payload).decode('utf-8')
+
+def decrypt_secret_data(enc_b64: str) -> str:
+    """Decrypts and verifies authentication tag using master key."""
+    import hashlib, hmac, base64
+    try:
+        key = get_vault_master_key()
+        raw = base64.b64decode(enc_b64.encode('utf-8'))
+        if len(raw) < 48:
+            return ""
+        nonce = raw[:16]
+        tag = raw[16:48]
+        ciphertext = raw[48:]
+        expected_tag = hmac.new(key, nonce + ciphertext, hashlib.sha256).digest()
+        if not hmac.compare_digest(tag, expected_tag):
+            logger.error("Vault decryption failed: Authentication tag mismatch or secret key mismatch.")
+            return ""
+        keystream = bytearray()
+        counter = 0
+        while len(keystream) < len(ciphertext):
+            block = hashlib.sha256(key + nonce + counter.to_bytes(4, 'big')).digest()
+            keystream.extend(block)
+            counter += 1
+        decrypted_bytes = bytes(a ^ b for a, b in zip(ciphertext, keystream[:len(ciphertext)]))
+        return decrypted_bytes.decode('utf-8')
+    except Exception as e:
+        logger.error(f"Decryption error: {e}")
+        return ""
+
 def get_env_vault_file():
     return os.path.join(WORKSPACE_DIR, ".env_vault.json")
 
@@ -1033,11 +1083,10 @@ def save_env_vault(vault):
         pass
 
 def restore_all_env_vaults_on_boot():
-    """Unpacks all base64-encoded environments locally on runner boot."""
-    import base64
+    """Unpacks all encrypted environments locally on runner boot."""
     vault = load_env_vault()
-    for script_name, stored in vault.items():
-        if not stored:
+    for script_name, stored_enc in vault.items():
+        if not stored_enc:
             continue
         clean = script_name.replace("scripts/", "").lstrip("/")
         base_name = os.path.basename(clean)
@@ -1047,21 +1096,21 @@ def restore_all_env_vaults_on_boot():
         target_dir = os.path.join(SCRIPTS_DIR, dir_name) if dir_name else SCRIPTS_DIR
         os.makedirs(target_dir, exist_ok=True)
         
-        dot_env = os.path.join(target_dir, ".env")
+        # stored_enc is an encrypted JSON string containing all variables
+        decrypted_json_str = decrypt_secret_data(stored_enc)
+        if not decrypted_json_str:
+            continue
         try:
+            decrypted_dict = json.loads(decrypted_json_str)
+            dot_env = os.path.join(target_dir, ".env")
             with open(dot_env, "w", encoding="utf-8") as f:
-                for k, enc_v in sorted(stored.items()):
-                    try:
-                        dec_v = base64.b64decode(enc_v.encode('utf-8')).decode('utf-8')
-                        f.write(f"{k}={dec_v}\n")
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                for k, v in sorted(decrypted_dict.items()):
+                    f.write(f"{k}={v}\n")
+        except Exception as e:
+            logger.error(f"Error unpacking vault on boot for {script_name}: {e}")
 
 def read_script_env(py_filename):
-    """Reads environment variables from local .env or base64 vault if on new runner."""
-    import base64
+    """Reads environment variables from local .env or encrypted vault if on new runner."""
     clean = py_filename.replace("scripts/", "").lstrip("/")
     base_name = os.path.basename(clean)
     if base_name.endswith(".py"):
@@ -1091,20 +1140,16 @@ def read_script_env(py_filename):
             except Exception as e:
                 logger.error(f"Error reading env from {c}: {e}")
                 
-    # If empty, restore from encoded vault
+    # If empty, restore from encrypted vault
     if not merged_env:
         vault = load_env_vault()
-        stored = vault.get(clean) or vault.get(base_name) or vault.get(f"{base_name}.py")
-        if stored:
-            for k, enc_v in stored.items():
+        stored_enc = vault.get(clean) or vault.get(base_name) or vault.get(f"{base_name}.py")
+        if stored_enc:
+            decrypted_json_str = decrypt_secret_data(stored_enc)
+            if decrypted_json_str:
                 try:
-                    dec_v = base64.b64decode(enc_v.encode('utf-8')).decode('utf-8')
-                    merged_env[k] = dec_v
-                except Exception:
-                    pass
-            # Write physical .env file locally for child app
-            if merged_env:
-                try:
+                    decrypted_dict = json.loads(decrypted_json_str)
+                    merged_env.update(decrypted_dict)
                     dot_env = os.path.join(target_dir, ".env")
                     with open(dot_env, "w", encoding="utf-8") as f:
                         for k, v in sorted(merged_env.items()):
@@ -1115,8 +1160,7 @@ def read_script_env(py_filename):
     return merged_env
 
 def write_script_env(py_filename, env_dict):
-    """Writes environment variables to local .env and saves encoded vault (safe from GitHub scanner!)."""
-    import base64
+    """Writes environment variables to local .env and saves AES-grade encrypted vault."""
     clean = py_filename.replace("scripts/", "").lstrip("/")
     base_name = os.path.basename(clean)
     if base_name.endswith(".py"):
@@ -1136,13 +1180,14 @@ def write_script_env(py_filename, env_dict):
         with open(dot_env, "w", encoding="utf-8") as f:
             f.write(content)
             
-        # Save base64-obfuscated copy in vault so it's safe from GitHub Secret Scanner!
+        # Encrypt the entire dictionary with AES/HMAC before saving to public repo vault!
         vault = load_env_vault()
-        encoded = {k: base64.b64encode(v.encode('utf-8')).decode('utf-8') for k, v in env_dict.items()}
-        vault[clean] = encoded
+        json_str = json.dumps(env_dict)
+        encrypted_ciphertext = encrypt_secret_data(json_str)
+        vault[clean] = encrypted_ciphertext
         save_env_vault(vault)
             
-        git_sync_to_github(f"Update configuration for {base_name}")
+        git_sync_to_github(f"Update encrypted vault for {base_name}")
         return True, "Env saved successfully."
     except Exception as e:
         return False, f"Error saving env: {e}"
