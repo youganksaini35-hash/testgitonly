@@ -71,41 +71,37 @@ def normalize_telethon_session(session_str: str) -> str:
 
     return session_str
 
+CLOUDFLARE_BIN = "/tmp/cloudflared"
+TUNNEL_LOG = "/tmp/cloudflared.log"
+SYNC_SECRET = os.environ.get("SYNC_SECRET", "tgdrive_live_auto_sync_secret_2026")
+GATEWAY_URL = os.environ.get("GATEWAY_URL", "https://tgdriveapi.youganksaini1.workers.dev")
+
+async def sync_url_to_gateway(url: str):
+    """Auto-syncs live tunnel URL to Cloudflare Gateway"""
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            res = await client.post(
+                f"{GATEWAY_URL}/internal/update-tunnel",
+                headers={"X-Sync-Secret": SYNC_SECRET},
+                json={"backend_url": url}
+            )
+            if res.status_code == 200:
+                print("✅ [Auto-Sync] Live backend successfully synchronized to Cloudflare Gateway!")
+            else:
+                print(f"[Auto-Sync Notice] Status {res.status_code}: {res.text}")
+    except Exception as e:
+        print(f"[Auto-Sync Error] {e}")
+
 async def start_auto_tunnel():
     """
-    Automatically creates a high-performance permanent public tunnel using Ngrok
-    with Cloudflare Tunnel as a fallback.
+    Automatically creates a high-speed Unlimited Cloudflare Tunnel
+    and synchronizes the live URL directly to Cloudflare Gateway.
     """
     await asyncio.sleep(2)
     port = int(os.environ.get("PORT", "8000"))
-    ngrok_token = os.environ.get("NGROK_AUTHTOKEN", DEFAULT_NGROK_TOKEN).strip()
-    ngrok_domain = os.environ.get("NGROK_DOMAIN", "").strip()
 
-    # 1. Primary: Ngrok Permanent Tunnel
-    if ngrok_token:
-        try:
-            from pyngrok import ngrok, conf
-            print("[Tunnel] Authenticating with Ngrok using permanent authtoken...")
-            conf.get_default().auth_token = ngrok_token
-            
-            connect_kwargs = {"addr": port, "proto": "http"}
-            if ngrok_domain:
-                connect_kwargs["domain"] = ngrok_domain
-
-            tunnel = ngrok.connect(**connect_kwargs)
-            public_url = tunnel.public_url.replace("http://", "https://")
-
-            print("\n" + "="*60)
-            print("🌟 PUBLIC PERMANENT BACKEND URL FOR CLOUDFLARE:")
-            print(f"👉 {public_url}")
-            print("="*60)
-            print("✅ Permanent Tunnel is LIVE! (Persistent across restarts)")
-            print("="*60 + "\n")
-            return
-        except Exception as ngrok_err:
-            print(f"[Ngrok Notice] {ngrok_err} - Falling back to Cloudflare tunnel...")
-
-    # 2. Fallback: Standalone Cloudflare Tunnel
+    # Download Cloudflare binary if not present
     try:
         if not os.path.exists(CLOUDFLARE_BIN):
             print("[Tunnel] Downloading standalone Cloudflare binary...")
@@ -127,6 +123,7 @@ async def start_auto_tunnel():
                 stderr=log_file
             )
 
+            discovered_url = None
             for _ in range(30):
                 await asyncio.sleep(1)
                 if os.path.exists(TUNNEL_LOG):
@@ -135,12 +132,23 @@ async def start_auto_tunnel():
                         import re
                         match = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", content)
                         if match:
-                            url = match.group(0)
+                            discovered_url = match.group(0)
                             print("\n" + "="*60)
-                            print("🌟 PUBLIC BACKEND URL FOR CLOUDFLARE:")
-                            print(f"👉 {url}")
+                            print("🌟 LIVE UNLIMITED CLOUDFLARE TUNNEL URL:")
+                            print(f"👉 {discovered_url}")
+                            print("="*60)
+                            print("🚀 Bandwidth: UNLIMITED (Zero Data Cap / 100% Free)")
                             print("="*60 + "\n")
                             break
+
+            if discovered_url:
+                await sync_url_to_gateway(discovered_url)
+
+                # Keep periodic background sync every 3 minutes
+                while True:
+                    await asyncio.sleep(180)
+                    await sync_url_to_gateway(discovered_url)
+
     except Exception as err:
         print(f"[Tunnel Startup Notice] {err}")
 
