@@ -513,25 +513,71 @@ def child_watchdog(proc, fname):
             markup = get_main_menu_keyboard()
         notify_all_admins(alert_text, reply_markup=markup)
 
+# ---------------------------------------------------------------------------
+# Virtualenv & Multi-Python Environment Isolation Engine
+# ---------------------------------------------------------------------------
+VENVS_DIR = os.path.join(WORKSPACE_DIR, ".venvs")
 installed_req_hashes = {}
 
-def check_and_install_reqs(req_path):
-    """Smart installer: only runs pip if the file hasn't been installed in this session or changed."""
+def get_script_venv_slug(clean_name):
+    """Generates a clean directory slug for the script's virtualenv."""
+    dir_name = os.path.dirname(clean_name)
+    if dir_name:
+        return dir_name.replace("/", "_").replace("\\", "_")
+    base = os.path.splitext(os.path.basename(clean_name))[0]
+    return base.replace(".", "_")
+
+def get_script_venv_dir(clean_name):
+    slug = get_script_venv_slug(clean_name)
+    return os.path.join(VENVS_DIR, slug)
+
+def get_or_create_venv(clean_name):
+    """Returns (python_bin, pip_bin, venv_dir) for isolated script execution."""
+    os.makedirs(VENVS_DIR, exist_ok=True)
+    venv_dir = get_script_venv_dir(clean_name)
+    py_bin = os.path.join(venv_dir, "bin", "python")
+    pip_bin = os.path.join(venv_dir, "bin", "pip")
+    
+    # On Windows fallback compatibility
+    if not os.path.exists(py_bin) and os.path.exists(os.path.join(venv_dir, "Scripts", "python.exe")):
+        py_bin = os.path.join(venv_dir, "Scripts", "python.exe")
+        pip_bin = os.path.join(venv_dir, "Scripts", "pip.exe")
+
+    if not os.path.exists(py_bin):
+        logger.info(f"🛡️ Creating isolated virtualenv for {clean_name} at {venv_dir}...")
+        try:
+            subprocess.run([sys.executable, "-m", "venv", venv_dir], check=True, capture_output=True)
+        except Exception as e:
+            logger.error(f"Failed to create venv: {e}, falling back to system python")
+            return sys.executable, [sys.executable, "-m", "pip"], None
+
+    return py_bin, pip_bin, venv_dir
+
+def check_and_install_reqs(req_path, clean_name=None):
+    """Smart installer: installs packages into the script's isolated virtualenv."""
     if not req_path or not os.path.exists(req_path):
         return
     import hashlib
     try:
         with open(req_path, "rb") as f:
             file_hash = hashlib.md5(f.read()).hexdigest()
-        if installed_req_hashes.get(req_path) == file_hash:
-            # Already installed in this runner session! Skip with 0ms delay!
+            
+        hash_key = f"{clean_name or 'global'}:{req_path}"
+        if installed_req_hashes.get(hash_key) == file_hash:
             return
         
-        logger.info(f"Installing requirements from {os.path.basename(req_path)}...")
-        subprocess.run([sys.executable, "-m", "pip", "install", "-r", req_path], capture_output=True, text=True)
-        installed_req_hashes[req_path] = file_hash
+        py_bin, pip_bin, venv_dir = get_or_create_venv(clean_name or "global")
+        logger.info(f"📦 Installing requirements into isolated venv ({clean_name}) from {os.path.basename(req_path)}...")
+        
+        if isinstance(pip_bin, list):
+            cmd = pip_bin + ["install", "-r", req_path]
+        else:
+            cmd = [pip_bin, "install", "-r", req_path]
+            
+        subprocess.run(cmd, capture_output=True, text=True)
+        installed_req_hashes[hash_key] = file_hash
     except Exception as e:
-        logger.error(f"Error checking requirements hash: {e}")
+        logger.error(f"Error installing requirements: {e}")
 
 def start_child_app(filename="bot.py"):
     # Strip any prefix like scripts/
@@ -564,12 +610,15 @@ def start_child_app(filename="bot.py"):
         pid = active_now[clean_name]["pid"]
         return False, f"⚠️ <code>{clean_name}</code> is already running (PID: <code>{pid}</code>)."
 
-    # Smart Auto-install: only if not already installed in current session
+    # 1. Get or create isolated Virtualenv for this script/project!
+    venv_py, venv_pip, venv_dir = get_or_create_venv(clean_name)
+
+    # 2. Smart Auto-install dependencies into isolated venv
     req_path = get_script_req_path(clean_name)
     if req_path:
-        check_and_install_reqs(req_path)
+        check_and_install_reqs(req_path, clean_name=clean_name)
 
-    # Security scan before launch
+    # 3. Security scan before launch
     abuse_reason = scan_script_for_abuse(full_path)
     if abuse_reason:
         return False, (
@@ -581,6 +630,9 @@ def start_child_app(filename="bot.py"):
     try:
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        if venv_dir:
+            env["VIRTUAL_ENV"] = venv_dir
+            env["PATH"] = f"{os.path.join(venv_dir, 'bin')}:{env.get('PATH', '')}"
         env["PYTHONPATH"] = f"{script_working_dir}:{SCRIPTS_DIR}:{WORKSPACE_DIR}:{env.get('PYTHONPATH', '')}"
         
         # Inject global env vars
@@ -590,7 +642,7 @@ def start_child_app(filename="bot.py"):
         script_private_env = read_script_env(clean_name)
         env.update(script_private_env)
         
-        # Ensure a physical .env file exists in the script's cwd so python-dotenv / dotenv.load_dotenv() works!
+        # Ensure a physical .env file exists in the script's cwd so python-dotenv works!
         if script_private_env:
             target_dot_env = os.path.join(script_working_dir, ".env")
             try:
@@ -600,7 +652,8 @@ def start_child_app(filename="bot.py"):
             except Exception as e:
                 logger.error(f"Error creating local .env: {e}")
         
-        cmd = [sys.executable, "-u", full_path]
+        # Launch using the isolated virtualenv Python binary!
+        cmd = [venv_py, "-u", full_path]
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -1366,6 +1419,7 @@ def prompt_script_env_dashboard(chat_id, user_id, py_filename, message_id=None):
             {"text": "🗑️ Delete Variable", "callback_data": f"env_del_list_{py_filename}"}
         ],
         [
+            {"text": "🛡️ View Venv Packages", "callback_data": f"venv_list_{py_filename}"},
             {"text": f"📥 Export {base_name}.env", "callback_data": f"env_exp_{py_filename}"}
         ]
     ]
@@ -1864,6 +1918,30 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
         else:
             answer_callback(callback_id, "No .env file found for this script.", show_alert=True)
 
+    # 2h. View Virtualenv Packages
+    elif data.startswith("venv_list_"):
+        fname = data.replace("venv_list_", "")
+        answer_callback(callback_id, "Listing packages...")
+        py_bin, pip_bin, venv_dir = get_or_create_venv(fname)
+        
+        cmd = [pip_bin, "list", "--format=columns"] if not isinstance(pip_bin, list) else pip_bin + ["list", "--format=columns"]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        pkg_out = res.stdout.strip() or "(No packages installed in this venv)"
+        
+        text = (
+            f"🛡️ <b>Isolated Environment:</b> <code>scripts/{fname}</code>\n"
+            f"📁 <b>Venv Path:</b> <code>{venv_dir or 'Global'}</code>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<pre>{html.escape(pkg_out[-2500:])}</pre>"
+        )
+        markup = {
+            "inline_keyboard": [
+                [{"text": "🔙 Back to Script ENVs", "callback_data": f"env_dash_{fname}"}],
+                [{"text": "🔙 Main Menu", "callback_data": "menu_main"}]
+            ]
+        }
+        edit_tg_message(chat_id, message_id, text, reply_markup=markup)
+
     # 3. Runner Menu
     elif data in ["menu_runner", "menu_run_select"]:
         answer_callback(callback_id)
@@ -1874,10 +1952,12 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
         parts = data.replace("autofix_pkg_", "").split("_", 1)
         if len(parts) == 2:
             pkg_name, target_py = parts[0], parts[1]
-            answer_callback(callback_id, f"Installing {pkg_name}...")
-            send_tg_message(chat_id, f"⏳ <b>Auto-Installing:</b> <code>{pkg_name}</code> for <code>{target_py}</code>...")
+            answer_callback(callback_id, f"Installing {pkg_name} into isolated venv...")
+            send_tg_message(chat_id, f"⏳ <b>Auto-Installing:</b> <code>{pkg_name}</code> into isolated environment for <code>{target_py}</code>...")
             
-            res = subprocess.run([sys.executable, "-m", "pip", "install", pkg_name], capture_output=True, text=True)
+            py_bin, pip_bin, venv_dir = get_or_create_venv(target_py)
+            cmd = [pip_bin, "install", pkg_name] if not isinstance(pip_bin, list) else pip_bin + ["install", pkg_name]
+            res = subprocess.run(cmd, capture_output=True, text=True)
             
             # Save into target_py's dedicated requirements file
             base_n = target_py.rsplit('.', 1)[0]
@@ -1889,7 +1969,7 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
                     f.write(f"\n{pkg_name}\n")
             git_sync_to_github(f"Add {pkg_name} to {base_n}.requirements.txt")
             
-            send_tg_message(chat_id, f"✅ <b>{pkg_name} installed & saved to {base_n}.requirements.txt!</b>\n🚀 Now auto-launching <code>{target_py}</code>...")
+            send_tg_message(chat_id, f"✅ <b>{pkg_name} installed in isolated venv & saved to {base_n}.requirements.txt!</b>\n🚀 Now auto-launching <code>{target_py}</code>...")
             res_ok, res_msg = start_child_app(target_py)
             send_tg_message(chat_id, res_msg, reply_markup=get_main_menu_keyboard())
 
