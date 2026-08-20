@@ -953,6 +953,33 @@ def handle_text_message(chat_id, user_id, text):
             )
         return
 
+    elif isinstance(state, dict) and state.get("action") == "WAITING_CUSTOM_PY_NAME":
+        custom_name = raw_text.strip()
+        if not custom_name.endswith(".py"):
+            custom_name += ".py"
+        # Sanitize filename
+        custom_name = custom_name.replace("/", "_").replace("\\", "_")
+        staged_path = state.get("staging_path")
+        if staged_path and os.path.exists(staged_path):
+            import shutil
+            dest_path = os.path.join(SCRIPTS_DIR, custom_name)
+            shutil.move(staged_path, dest_path)
+            user_states.pop(user_id, None)
+            git_sync_to_github(f"Upload {custom_name}")
+            send_tg_message(
+                chat_id,
+                f"✅ <b>Saved as <code>{custom_name}</code>!</b>\n\nTap below to launch immediately:",
+                reply_markup={
+                    "inline_keyboard": [
+                        [{"text": f"▶️ Run {custom_name} Now", "callback_data": f"exec_run_{custom_name}"}],
+                        [{"text": f"⚙️ Manage {custom_name} ENV", "callback_data": f"env_dash_{custom_name}"}],
+                        [{"text": "🚀 Scripts Runner", "callback_data": "menu_runner"}],
+                        [{"text": "🔙 Main Menu", "callback_data": "menu_main"}]
+                    ]
+                }
+            )
+            return
+
     elif state == "WAITING_RUN_FILE":
         user_states.pop(user_id, None)
         filename = raw_text
@@ -1873,6 +1900,79 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
         ok, msg = start_child_app(fname)
         send_tg_message(chat_id, msg, reply_markup=get_main_menu_keyboard())
 
+    # 4b. Instance Conflict Resolution Callbacks
+    elif data.startswith("inst_parallel_"):
+        fname = data.replace("inst_parallel_", "")
+        state = user_states.get(user_id, {})
+        staged_path = state.get("staging_path")
+        if not staged_path or not os.path.exists(staged_path):
+            answer_callback(callback_id, "Staged file expired. Please upload again.", show_alert=True)
+            return
+        
+        active = get_active_running_processes()
+        base, ext = os.path.splitext(fname)
+        idx = 2
+        while os.path.exists(os.path.join(SCRIPTS_DIR, f"{base}_{idx}{ext}")) or f"{base}_{idx}{ext}" in active:
+            idx += 1
+        new_name = f"{base}_{idx}{ext}"
+        new_path = os.path.join(SCRIPTS_DIR, new_name)
+        
+        import shutil
+        shutil.move(staged_path, new_path)
+        user_states.pop(user_id, None)
+        git_sync_to_github(f"Create parallel instance: {new_name}")
+        
+        answer_callback(callback_id, f"Launching {new_name}...")
+        ok, msg = start_child_app(new_name)
+        send_tg_message(chat_id, f"🔀 <b>Created & Launched Parallel Instance:</b> <code>{new_name}</code>\n\n{msg}", reply_markup=get_main_menu_keyboard())
+
+    elif data.startswith("inst_replace_"):
+        fname = data.replace("inst_replace_", "")
+        state = user_states.get(user_id, {})
+        staged_path = state.get("staging_path")
+        if not staged_path or not os.path.exists(staged_path):
+            answer_callback(callback_id, "Staged file expired. Please upload again.", show_alert=True)
+            return
+        
+        target_path = os.path.join(SCRIPTS_DIR, fname)
+        answer_callback(callback_id, f"Replacing and restarting {fname}...")
+        
+        stop_child_app(script_name=fname, clear_active=False)
+        time.sleep(1.0)
+        
+        import shutil
+        shutil.move(staged_path, target_path)
+        user_states.pop(user_id, None)
+        git_sync_to_github(f"Update and replace: {fname}")
+        
+        ok, msg = start_child_app(fname)
+        send_tg_message(chat_id, f"🔄 <b>Updated & Restarted Instance:</b> <code>{fname}</code>\n\n{msg}", reply_markup=get_main_menu_keyboard())
+
+    elif data.startswith("inst_custom_"):
+        fname = data.replace("inst_custom_", "")
+        answer_callback(callback_id)
+        if user_id in user_states and isinstance(user_states[user_id], dict):
+            user_states[user_id]["action"] = "WAITING_CUSTOM_PY_NAME"
+        text = (
+            "✏️ <b>Enter Custom Filename</b>\n\n"
+            f"Please send the new filename for this script:\n"
+            f"<i>(Example: <code>worker.py</code>, <code>tg_bot.py</code>, <code>userbot.py</code>)</i>"
+        )
+        markup = {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": f"inst_cancel_{fname}"}]]}
+        edit_tg_message(chat_id, message_id, text, reply_markup=markup)
+
+    elif data.startswith("inst_cancel_"):
+        state = user_states.get(user_id, {})
+        staged_path = state.get("staging_path") if isinstance(state, dict) else None
+        if staged_path and os.path.exists(staged_path):
+            try:
+                os.remove(staged_path)
+            except Exception:
+                pass
+        user_states.pop(user_id, None)
+        answer_callback(callback_id, "Upload cancelled.")
+        edit_tg_message(chat_id, message_id, "❌ <b>Upload cancelled.</b> Running instances were not modified.", reply_markup=get_main_menu_keyboard())
+
     # 5. Stop Script Menu
     elif data == "menu_stop":
         answer_callback(callback_id)
@@ -2071,19 +2171,66 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
 # Document & File Upload Handler
 # ---------------------------------------------------------------------------
 def handle_document_upload(chat_id, user_id, doc):
-    global user_states
     if not is_admin(user_id):
-        send_tg_message(chat_id, "⛔ Access Denied.")
+        send_tg_message(chat_id, f"⛔ <b>Access Denied:</b> User ID <code>{user_id}</code> is not authorized.")
         return
-    
+
     file_id = doc.get("file_id")
     file_name = doc.get("file_name", f"file_{int(time.time())}")
     
-    # Save script assets directly into scripts/ folder
     os.makedirs(SCRIPTS_DIR, exist_ok=True)
     scripts_path = os.path.join(SCRIPTS_DIR, file_name)
     root_path = os.path.join(WORKSPACE_DIR, file_name)
     
+    # 0. Check if uploading a .py file that is ALREADY RUNNING
+    if file_name.endswith(".py"):
+        active = get_active_running_processes()
+        if file_name in active:
+            # Stage download in workspace
+            staging_path = os.path.join(WORKSPACE_DIR, f".staging_{user_id}_{int(time.time())}_{file_name}")
+            send_tg_message(chat_id, f"📥 <b>Receiving {file_name}...</b>")
+            ok, err = download_tg_file(file_id, staging_path)
+            if not ok:
+                send_tg_message(chat_id, f"❌ Download failed: {err}")
+                return
+                
+            user_states[user_id] = {
+                "action": "PENDING_DUPLICATE_UPLOAD",
+                "file_name": file_name,
+                "staging_path": staging_path
+            }
+            
+            pdata = active[file_name]
+            cu_sec = int(time.time() - pdata["start_time"])
+            ch, cr = divmod(cu_sec, 3600)
+            cm, _ = divmod(cr, 60)
+            
+            base, ext = os.path.splitext(file_name)
+            idx = 2
+            while os.path.exists(os.path.join(SCRIPTS_DIR, f"{base}_{idx}{ext}")) or f"{base}_{idx}{ext}" in active:
+                idx += 1
+            next_inst_name = f"{base}_{idx}{ext}"
+            
+            text = (
+                f"✨ <b>Python Script Received:</b> <code>{file_name}</code>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"⚠️ <b>Instance Alert:</b> <code>{file_name}</code> is currently <b>RUNNING (PID: {pdata['pid']} | {ch}h {cm}m)</b>.\n\n"
+                "<i>Choose how you want to deploy this file:</i>\n\n"
+                f"• <b>🔀 Run Parallel:</b> Saves as <code>{next_inst_name}</code> and runs alongside the existing instance.\n"
+                f"• <b>🔄 Update & Restart:</b> Stops PID {pdata['pid']}, replaces code, and restarts immediately."
+            )
+            markup = {
+                "inline_keyboard": [
+                    [{"text": f"🔀 Run Parallel ({next_inst_name})", "callback_data": f"inst_parallel_{file_name}"}],
+                    [{"text": f"🔄 Replace & Restart (PID {pdata['pid']})", "callback_data": f"inst_replace_{file_name}"}],
+                    [{"text": "✏️ Save with Custom Name", "callback_data": f"inst_custom_{file_name}"}],
+                    [{"text": "❌ Cancel Upload", "callback_data": f"inst_cancel_{file_name}"}]
+                ]
+            }
+            send_tg_message(chat_id, text, reply_markup=markup)
+            return
+
+    # Normal Download for non-conflicting files
     send_tg_message(chat_id, f"📥 <b>Receiving {file_name}...</b>")
     ok, err = download_tg_file(file_id, scripts_path)
     
@@ -2104,7 +2251,7 @@ def handle_document_upload(chat_id, user_id, doc):
     
     current_state = user_states.get(user_id)
     
-    # 0. If uploaded a .zip project archive
+    # 0b. If uploaded a .zip project archive
     if file_name.endswith(".zip"):
         import zipfile
         send_tg_message(chat_id, f"📦 <b>Unpacking Project Archive:</b> <code>{file_name}</code>...")
@@ -2264,6 +2411,7 @@ def handle_document_upload(chat_id, user_id, doc):
         markup = {
             "inline_keyboard": [
                 [{"text": f"▶️ Run {file_name} Now", "callback_data": f"exec_run_{file_name}"}],
+                [{"text": f"⚙️ Manage {file_name} ENV", "callback_data": f"env_dash_{file_name}"}],
                 [{"text": "🚀 Open Scripts Runner", "callback_data": "menu_runner"}],
                 [{"text": "🔙 Main Menu", "callback_data": "menu_main"}]
             ]
