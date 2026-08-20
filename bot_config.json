@@ -4,7 +4,8 @@
     7251749429
   ],
   "active_scripts": [
-    "bot/bot.py"
+    "bot/bot.py",
+    "app.py"
   ],
   "auto_run_file": "bot/bot.py",
   "env_vault": {
