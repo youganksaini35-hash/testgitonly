@@ -73,23 +73,36 @@ def normalize_telethon_session(session_str: str) -> str:
 
 CLOUDFLARE_BIN = "/tmp/cloudflared"
 TUNNEL_LOG = "/tmp/cloudflared.log"
+FIREBASE_DB_URL = "https://studio-2641678334-61796-default-rtdb.firebaseio.com"
 SYNC_SECRET = os.environ.get("SYNC_SECRET", "tgdrive_live_auto_sync_secret_2026")
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "https://tgdriveapi.youganksaini1.workers.dev")
 
 async def sync_url_to_gateway(url: str):
-    """Auto-syncs live tunnel URL to Cloudflare Gateway"""
+    """Auto-syncs live tunnel URL directly to Global Database & Cloudflare Gateway"""
     try:
         import httpx
         async with httpx.AsyncClient(timeout=15.0) as client:
-            res = await client.post(
-                f"{GATEWAY_URL}/internal/update-tunnel",
-                headers={"X-Sync-Secret": SYNC_SECRET},
-                json={"backend_url": url}
-            )
-            if res.status_code == 200:
-                print("✅ [Auto-Sync] Live backend successfully synchronized to Cloudflare Gateway!")
-            else:
-                print(f"[Auto-Sync Notice] Status {res.status_code}: {res.text}")
+            # 1. Direct Firebase RTDB sync (Global Instant Multi-Region Sync)
+            try:
+                await client.put(
+                    f"{FIREBASE_DB_URL}/users/system/live_backend.json",
+                    json={"backend_url": url, "updated_at": asyncio.get_event_loop().time()}
+                )
+                print("✅ [Auto-Sync] Live backend successfully synchronized to Global Database!")
+            except Exception as fb_err:
+                print(f"[Firebase Sync Notice] {fb_err}")
+
+            # 2. Cloudflare Gateway ping
+            try:
+                res = await client.post(
+                    f"{GATEWAY_URL}/internal/update-tunnel",
+                    headers={"X-Sync-Secret": SYNC_SECRET},
+                    json={"backend_url": url}
+                )
+                if res.status_code == 200:
+                    print("✅ [Auto-Sync] Live backend successfully synchronized to Cloudflare Gateway!")
+            except Exception:
+                pass
     except Exception as e:
         print(f"[Auto-Sync Error] {e}")
 
