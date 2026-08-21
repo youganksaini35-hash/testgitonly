@@ -61,7 +61,17 @@ from keyboards import (
     cancel_kb,
     back_to_main_kb
 )
-from helpers import clean_html, format_bytes, format_date, get_mime_icon, build_progress_card, build_loading_card, ProgressTracker
+from helpers import (
+    clean_html,
+    format_bytes,
+    format_date,
+    get_mime_icon,
+    make_progress_bar,
+    format_time_remaining,
+    build_progress_card,
+    build_loading_card,
+    ProgressTracker
+)
 
 # Logging configuration
 logging.basicConfig(
