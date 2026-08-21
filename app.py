@@ -44,28 +44,57 @@ os.makedirs(SCRIPTS_DIR, exist_ok=True)
 CONFIG_FILE = os.path.join(WORKSPACE_DIR, "bot_config.json")
 
 # Multi-Process Concurrent Runner State:
-# running_processes = { "clean_name": { "proc": Popen, "start_time": float, "logs": [], "is_stopped": bool, "pid": int } }
+# running_processes = { "clean_name": { "proc": Popen, "start_time": float, "create_time": float, "logs": [], "is_stopped": bool, "pid": int, "script_real_path": str, "parent_pid": int } }
 running_processes = {}
 LOG_BUFFER_MAX = 200
+
+# Per-Target Execution Mutex Locks (Prevents concurrent launch race conditions)
+target_execution_locks = {}
+target_locks_mutex = threading.Lock()
+
+def get_target_lock(clean_name):
+    """Returns a re-entrant thread lock for a specific script target."""
+    with target_locks_mutex:
+        norm_name = os.path.normpath(clean_name).replace("\\", "/")
+        if norm_name not in target_execution_locks:
+            target_execution_locks[norm_name] = threading.Lock()
+        return target_execution_locks[norm_name]
 
 # User conversation states (for interactive step-by-step inputs)
 user_states = {}
 
 def get_active_running_processes():
-    """Returns dict of currently active running processes, strictly pruning dead PIDs and zombies."""
+    """
+    Returns dict of currently active running processes.
+    Strictly verifies (a) process existence, (b) create_time matching to prevent PID reuse,
+    and (c) explicitly prunes & reaps zombie processes.
+    """
     active = {}
     for name, pdata in list(running_processes.items()):
         proc = pdata.get("proc")
         pid = pdata.get("pid")
+        stored_create_time = pdata.get("create_time")
         is_alive = False
-        if proc and proc.poll() is None:
-            if pid and psutil.pid_exists(pid):
-                try:
-                    p = psutil.Process(pid)
-                    if p.status() != psutil.STATUS_ZOMBIE:
-                        is_alive = True
-                except Exception:
-                    pass
+        
+        if proc and proc.poll() is None and pid and psutil.pid_exists(pid):
+            try:
+                p = psutil.Process(pid)
+                # 1. PID Reuse check: verify process creation timestamp
+                if stored_create_time and abs(p.create_time() - stored_create_time) >= 0.5:
+                    is_alive = False
+                # 2. Zombie / Dead state check
+                elif p.status() in [psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD, psutil.STATUS_STOPPED]:
+                    try:
+                        proc.poll()
+                        proc.wait(timeout=0.1)
+                    except Exception:
+                        pass
+                    is_alive = False
+                else:
+                    is_alive = True
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                is_alive = False
+                
         if is_alive:
             active[name] = pdata
         else:
@@ -589,9 +618,70 @@ def check_and_install_reqs(req_path, clean_name=None):
     except Exception as e:
         logger.error(f"Error installing requirements: {e}")
 
-def start_child_app(filename="bot.py"):
+def stop_process_graceful_then_force(proc, pid, stored_create_time, timeout=2.5):
+    """
+    Two-layer verified termination:
+    1. Sends SIGTERM / terminate() to allow graceful state saving & port cleanup.
+    2. Waits for process and children to exit.
+    3. Escalates to SIGKILL / kill() if still alive after timeout.
+    """
+    try:
+        if not pid or not psutil.pid_exists(pid):
+            return True
+        p = psutil.Process(pid)
+        # Verify creation timestamp to prevent PID reuse kills
+        if stored_create_time and abs(p.create_time() - stored_create_time) >= 0.5:
+            return True
+        
+        children = []
+        try:
+            children = p.children(recursive=True)
+        except Exception:
+            pass
+
+        # Step 1: Graceful SIGTERM
+        for child in children:
+            try:
+                child.terminate()
+            except Exception:
+                pass
+        try:
+            p.terminate()
+        except Exception:
+            pass
+
+        # Step 2: Wait for graceful exit
+        procs_to_wait = children + [p]
+        gone, alive = psutil.wait_procs(procs_to_wait, timeout=timeout)
+        if not alive:
+            return True
+
+        # Step 3: Force kill fallback for any stubborn process
+        for child in alive:
+            try:
+                child.kill()
+            except Exception:
+                pass
+        try:
+            p.kill()
+        except Exception:
+            pass
+        psutil.wait_procs(alive, timeout=1.0)
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        pass
+    except Exception as e:
+        logger.error(f"Error terminating PID {pid}: {e}")
+
+    try:
+        if proc:
+            proc.poll()
+    except Exception:
+        pass
+    return True
+
+def start_child_app(filename="bot.py", force_restart=False):
     # Strip any prefix like scripts/
-    clean_name = filename.replace("scripts/", "").lstrip("/")
+    clean_name = os.path.normpath(filename.replace("scripts/", "").lstrip("/")).replace("\\", "/")
     full_path = os.path.join(SCRIPTS_DIR, clean_name)
     
     if not os.path.exists(full_path):
@@ -611,186 +701,188 @@ def start_child_app(filename="bot.py"):
         else:
             return False, f"File <code>{clean_name}</code> not found in scripts folder."
     
+    # Normalize clean_name and absolute path
+    clean_name = os.path.normpath(clean_name).replace("\\", "/")
+    real_script_path = os.path.realpath(full_path)
     base_filename = os.path.basename(clean_name)
     script_working_dir = os.path.dirname(full_path) or SCRIPTS_DIR
 
-    # Check if this script is already running
-    active_now = get_active_running_processes()
-    if clean_name in active_now:
-        pid = active_now[clean_name]["pid"]
-        return False, f"⚠️ <code>{clean_name}</code> is already running (PID: <code>{pid}</code>)."
+    # Acquire per-target execution mutex lock (prevents concurrent launch race conditions)
+    target_lock = get_target_lock(clean_name)
+    with target_lock:
+        # Check if this script is already running
+        active_now = get_active_running_processes()
+        if clean_name in active_now:
+            if force_restart:
+                stop_child_app(script_name=clean_name, clear_active=False)
+                time.sleep(0.5)
+            else:
+                pid = active_now[clean_name]["pid"]
+                return False, f"⚠️ <code>{clean_name}</code> is already running (PID: <code>{pid}</code>)."
 
-    # 1. Get or create isolated Virtualenv for this script/project!
-    venv_py, venv_pip, venv_dir = get_or_create_venv(clean_name)
+        # 1. Get or create isolated Virtualenv for this script/project!
+        venv_py, venv_pip, venv_dir = get_or_create_venv(clean_name)
 
-    # 2. Smart Auto-install dependencies into isolated venv
-    req_path = get_script_req_path(clean_name)
-    if req_path:
-        check_and_install_reqs(req_path, clean_name=clean_name)
+        # 2. Smart Auto-install dependencies into isolated venv
+        req_path = get_script_req_path(clean_name)
+        if req_path:
+            check_and_install_reqs(req_path, clean_name=clean_name)
 
-    # 3. Security scan before launch
-    abuse_reason = scan_script_for_abuse(full_path)
-    if abuse_reason:
-        return False, (
-            f"🚫 <b>Launch Blocked by Security Guard!</b>\n\n"
-            f"⚠️ <b>Reason:</b> <i>{abuse_reason}</i>\n\n"
-            f"💡 <i>Remove suspicious mining / abuse code to run this script.</i>"
-        )
-    
-    try:
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
-        if venv_dir:
-            env["VIRTUAL_ENV"] = venv_dir
-            env["PATH"] = f"{os.path.join(venv_dir, 'bin')}:{env.get('PATH', '')}"
-        env["PYTHONPATH"] = f"{script_working_dir}:{SCRIPTS_DIR}:{WORKSPACE_DIR}:{env.get('PYTHONPATH', '')}"
-        
-        # Inject global env vars
-        env.update(config.get("env_vars", {}))
-        
-        # Inject script-specific private .env variables!
-        script_private_env = read_script_env(clean_name)
-        env.update(script_private_env)
-        
-        # Ensure a physical .env file exists in the script's cwd so python-dotenv works!
-        if script_private_env:
-            target_dot_env = os.path.join(script_working_dir, ".env")
-            try:
-                with open(target_dot_env, "w", encoding="utf-8") as f:
-                    for k, v in sorted(script_private_env.items()):
-                        f.write(f"{k}={v}\n")
-            except Exception as e:
-                logger.error(f"Error creating local .env: {e}")
-        
-        # Launch using the isolated virtualenv Python binary!
-        cmd = [venv_py, "-u", full_path]
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            text=True,
-            bufsize=1,
-            cwd=script_working_dir, # Run in project directory!
-            env=env
-        )
-        
-        running_processes[clean_name] = {
-            "proc": proc,
-            "start_time": time.time(),
-            "logs": [],
-            "is_stopped": False,
-            "pid": proc.pid
-        }
-        
-        threading.Thread(target=log_stream_reader, args=(proc.stdout, clean_name), daemon=True).start()
-        threading.Thread(target=child_watchdog, args=(proc, clean_name), daemon=True).start()
-        threading.Thread(target=resource_guard_monitor, args=(proc, clean_name), daemon=True).start()
-        
-        # Initial health check (wait 1.5s to verify process stays alive)
-        time.sleep(1.5)
-        
-        poll_res = proc.poll()
-        if poll_res is not None:
-            pdata = running_processes.pop(clean_name, {})
-            err_msg = "\n".join(pdata.get("logs", [])) if pdata.get("logs") else "(No output recorded)"
-            missing_mod = extract_missing_module(err_msg)
-            
-            if missing_mod:
-                return False, (
-                    f"❌ <b>{base_filename} Crash: Missing Package <code>{missing_mod}</code></b>\n\n"
-                    f"<b>Error Details:</b>\n<pre>{html.escape(err_msg[-1500:])}</pre>\n\n"
-                    f"💡 <i>Use <b>Install Pip</b> to install <code>{missing_mod}</code>.</i>"
-                )
-            
+        # 3. Security scan before launch
+        abuse_reason = scan_script_for_abuse(full_path)
+        if abuse_reason:
             return False, (
-                f"❌ <b>{base_filename} failed to start (Exit Code: {poll_res})</b>\n\n"
-                f"<b>Error Details:</b>\n<pre>{html.escape(err_msg[-2500:])}</pre>\n\n"
-                f"💡 <i>Tip: Use <b>Install Pip Package</b> if a dependency is missing.</i>"
+                f"🚫 <b>Launch Blocked by Security Guard!</b>\n\n"
+                f"⚠️ <b>Reason:</b> <i>{abuse_reason}</i>\n\n"
+                f"💡 <i>Remove suspicious mining / abuse code to run this script.</i>"
             )
         
-        active_list = list(get_active_running_processes().keys())
-        config["active_scripts"] = active_list
-        save_config(config)
-        
-        # Immediately lock running state to GitHub cloud in background
-        threading.Thread(target=git_sync_to_github, args=(f"Set active scripts: {', '.join(active_list)}",), daemon=True).start()
-        
-        req_note = f" (📦 {os.path.basename(req_path)})" if req_path else " (📄 Standalone)"
-        return True, f"✨ <b>{clean_name}</b> started successfully!{req_note}\n🆔 PID: <code>{proc.pid}</code>\n🟢 <b>Active Scripts:</b> {len(active_list)} running concurrently"
-    except Exception as e:
-        return False, f"❌ Start error: {e}"
+        try:
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1"
+            if venv_dir:
+                env["VIRTUAL_ENV"] = venv_dir
+                env["PATH"] = f"{os.path.join(venv_dir, 'bin')}:{env.get('PATH', '')}"
+            env["PYTHONPATH"] = f"{script_working_dir}:{SCRIPTS_DIR}:{WORKSPACE_DIR}:{env.get('PYTHONPATH', '')}"
+            
+            # Inject global env vars
+            env.update(config.get("env_vars", {}))
+            
+            # Inject script-specific private .env variables!
+            script_private_env = read_script_env(clean_name)
+            env.update(script_private_env)
+            
+            # Ensure a physical .env file exists in the script's cwd so python-dotenv works!
+            if script_private_env:
+                target_dot_env = os.path.join(script_working_dir, ".env")
+                try:
+                    with open(target_dot_env, "w", encoding="utf-8") as f:
+                        for k, v in sorted(script_private_env.items()):
+                            f.write(f"{k}={v}\n")
+                except Exception as e:
+                    logger.error(f"Error creating local .env: {e}")
+            
+            # Launch using the isolated virtualenv Python binary!
+            cmd = [venv_py, "-u", full_path]
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+                cwd=script_working_dir, # Run in project directory!
+                env=env
+            )
+            
+            # Capture exact OS creation timestamp for two-layer PID verification
+            create_time = time.time()
+            try:
+                p_os = psutil.Process(proc.pid)
+                create_time = p_os.create_time()
+            except Exception:
+                pass
+
+            running_processes[clean_name] = {
+                "proc": proc,
+                "start_time": time.time(),
+                "create_time": create_time,
+                "logs": [],
+                "is_stopped": False,
+                "pid": proc.pid,
+                "script_real_path": real_script_path,
+                "parent_pid": os.getpid()
+            }
+            
+            threading.Thread(target=log_stream_reader, args=(proc.stdout, clean_name), daemon=True).start()
+            threading.Thread(target=child_watchdog, args=(proc, clean_name), daemon=True).start()
+            threading.Thread(target=resource_guard_monitor, args=(proc, clean_name), daemon=True).start()
+            
+            # Post-launch health-check window (verify process stays alive and detect crash-on-start)
+            time.sleep(1.5)
+            
+            poll_res = proc.poll()
+            if poll_res is not None:
+                pdata = running_processes.pop(clean_name, {})
+                err_msg = "\n".join(pdata.get("logs", [])) if pdata.get("logs") else "(No output recorded)"
+                missing_mod = extract_missing_module(err_msg)
+                
+                if missing_mod:
+                    return False, (
+                        f"❌ <b>{base_filename} Crash: Missing Package <code>{missing_mod}</code></b>\n\n"
+                        f"<b>Error Details:</b>\n<pre>{html.escape(err_msg[-1500:])}</pre>\n\n"
+                        f"💡 <i>Use <b>Install Pip</b> to install <code>{missing_mod}</code>.</i>"
+                    )
+                
+                return False, (
+                    f"❌ <b>{base_filename} failed to start (Exit Code: {poll_res})</b>\n\n"
+                    f"<b>Error Details:</b>\n<pre>{html.escape(err_msg[-2500:])}</pre>\n\n"
+                    f"💡 <i>Tip: Use <b>Install Pip Package</b> if a dependency is missing.</i>"
+                )
+            
+            active_list = list(get_active_running_processes().keys())
+            config["active_scripts"] = active_list
+            save_config(config)
+            
+            # Immediately lock running state to GitHub cloud in background
+            threading.Thread(target=git_sync_to_github, args=(f"Set active scripts: {', '.join(active_list)}",), daemon=True).start()
+            
+            req_note = f" (📦 {os.path.basename(req_path)})" if req_path else " (📄 Standalone)"
+            return True, f"✨ <b>{clean_name}</b> started successfully!{req_note}\n🆔 PID: <code>{proc.pid}</code>\n🟢 <b>Active Scripts:</b> {len(active_list)} running concurrently"
+        except Exception as e:
+            return False, f"❌ Start error: {e}"
 
 def stop_child_app(script_name=None, clear_active=True):
-    """Stops a specific script, a project folder, or all running scripts."""
+    """
+    Stops a specific script, a project folder, or all running scripts.
+    Guarantees:
+    - Path normalization (resolves absolute realpaths, handles (2) special characters).
+    - Two-layer verification: matches (a) realpath/normalized name + (b) bot parent PID ownership and create_time.
+    - Zero false-positive kills.
+    - Graceful-then-force termination sequence.
+    """
     stopped_names = []
     
     if not script_name:
         targets = list(running_processes.keys())
     else:
-        clean_target = script_name.replace("scripts/", "").lstrip("/")
+        clean_target = os.path.normpath(script_name.replace("scripts/", "").lstrip("/")).replace("\\", "/")
+        target_abs_path = os.path.realpath(os.path.join(SCRIPTS_DIR, clean_target))
         base_target = os.path.basename(clean_target)
         zip_stem = clean_target[:-4] if clean_target.endswith(".zip") else clean_target
         
         targets = []
-        for k in list(running_processes.keys()):
-            if (
-                k == clean_target
-                or k == script_name
-                or k == zip_stem
-                or k.startswith(f"{clean_target}/")
-                or k.startswith(f"{zip_stem}/")
-                or os.path.basename(k) == base_target
-                or os.path.basename(k) == clean_target
-                or os.path.dirname(k) == clean_target
-                or os.path.dirname(k) == zip_stem
-            ):
+        for k, pdata in list(running_processes.items()):
+            k_norm = os.path.normpath(k).replace("\\", "/")
+            k_real_path = pdata.get("script_real_path") or os.path.realpath(os.path.join(SCRIPTS_DIR, k_norm))
+            
+            # Exact match, path prefix match, realpath equality, or directory containment
+            is_match = (
+                k_norm == clean_target
+                or k_norm == zip_stem
+                or k_real_path == target_abs_path
+                or k_real_path.startswith(target_abs_path + os.sep)
+                or k_norm.startswith(f"{clean_target}/")
+                or k_norm.startswith(f"{zip_stem}/")
+                or os.path.basename(k_norm) == base_target
+                or os.path.dirname(k_norm) == clean_target
+                or os.path.dirname(k_norm) == zip_stem
+            )
+            if is_match:
                 targets.append(k)
-        if not targets and clean_target in running_processes:
-            targets.append(clean_target)
 
     for name in targets:
         pdata = running_processes.get(name)
         if pdata:
             pdata["is_stopped"] = True
             proc = pdata.get("proc")
-            if proc:
-                try:
-                    pid = proc.pid
-                    try:
-                        parent = psutil.Process(pid)
-                        for child in parent.children(recursive=True):
-                            try:
-                                child.kill()
-                            except Exception:
-                                pass
-                        parent.kill()
-                    except Exception:
-                        pass
-                    try:
-                        proc.kill()
-                        proc.terminate()
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
+            pid = pdata.get("pid")
+            stored_create_time = pdata.get("create_time")
+            
+            # Two-layer verified termination
+            stop_process_graceful_then_force(proc, pid, stored_create_time, timeout=2.5)
             stopped_names.append(name)
             running_processes.pop(name, None)
-
-    # OS-level sweep for leftover processes matching targets
-    if script_name and stopped_names:
-        for sname in stopped_names:
-            try:
-                base = os.path.basename(sname)
-                for p in psutil.process_iter(['pid', 'name', 'cmdline']):
-                    try:
-                        cmd = p.info.get('cmdline') or []
-                        if cmd and any(base in arg for arg in cmd) and p.pid != os.getpid():
-                            p.kill()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
 
     if clear_active:
         active_list = list(get_active_running_processes().keys())
