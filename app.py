@@ -1595,6 +1595,52 @@ def prompt_sh_menu(chat_id, user_id, message_id=None):
     else:
         send_tg_message(chat_id, text, reply_markup=markup)
 
+def send_logs_markdown_file(chat_id, script_name):
+    pdata = running_processes.get(script_name, {})
+    logs = pdata.get("logs", [])
+    pid = pdata.get("pid", "N/A")
+    uptime = ""
+    if pdata.get("start_time"):
+        cu_sec = int(time.time() - pdata["start_time"])
+        ch, cr = divmod(cu_sec, 3600)
+        cm, cs = divmod(cr, 60)
+        uptime = f"{ch}h {cm}m {cs}s"
+    
+    timestamp_str = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+    full_output = "\n".join(logs) if logs else "(No output recorded yet)"
+    clean_base = os.path.basename(script_name).replace(".py", "")
+    
+    md_content = (
+        f"# 📋 Live Execution Logs for `{script_name}`\n\n"
+        f"- **Timestamp:** `{timestamp_str}`\n"
+        f"- **Process PID:** `{pid}`\n"
+        f"- **Uptime:** `{uptime or 'N/A'}`\n"
+        f"- **Total Lines:** `{len(logs)}`\n\n"
+        "---\n\n"
+        "## 📜 Standard Output & Error Stream\n\n"
+        "```text\n"
+        f"{full_output}\n"
+        "```\n"
+    )
+    
+    temp_md_path = os.path.join(WORKSPACE_DIR, f"logs_{clean_base}.md")
+    try:
+        with open(temp_md_path, "w", encoding="utf-8") as f:
+            f.write(md_content)
+        send_tg_document(
+            chat_id,
+            temp_md_path,
+            caption=f"📋 <b>Complete Execution Logs:</b> <code>{script_name}</code> ({len(logs)} lines)"
+        )
+    except Exception as e:
+        logger.error(f"Error sending logs markdown: {e}")
+    finally:
+        try:
+            if os.path.exists(temp_md_path):
+                os.remove(temp_md_path)
+        except Exception:
+            pass
+
 def show_logs_view(chat_id, message_id=None, target_script=None):
     active = get_active_running_processes()
     
@@ -1610,16 +1656,31 @@ def show_logs_view(chat_id, message_id=None, target_script=None):
                 [{"text": "🔙 Main Menu", "callback_data": "menu_main"}]
             ]
         }
-    elif len(active) == 1 or target_script:
+        if message_id:
+            edit_tg_message(chat_id, message_id, text, reply_markup=markup)
+        else:
+            send_tg_message(chat_id, text, reply_markup=markup)
+        return
+
+    if len(active) == 1 or target_script:
         selected_script = target_script if target_script and target_script in running_processes else list(active.keys())[0]
         pdata = running_processes.get(selected_script, {})
         logs = pdata.get("logs", [])
         
+        full_log_str = "\n".join(logs)
+        is_too_big = len(full_log_str) > 2500 or len(logs) > 35
+        
         if not logs:
             log_text = "<i>(Process initialized, waiting for output...)</i>"
+        elif is_too_big:
+            recent = "\n".join(logs[-12:])
+            log_text = (
+                f"⚠️ <b>Logs are large ({len(logs)} lines | {len(full_log_str)} chars).</b>\n"
+                f"📄 <i>Full <code>logs_{os.path.basename(selected_script).replace('.py', '')}.md</code> file is sent below!</i>\n\n"
+                f"<b>Recent Output Preview:</b>\n<pre>{html.escape(recent)}</pre>"
+            )
         else:
-            recent = "\n".join(logs[-30:])
-            log_text = f"<pre>{html.escape(recent)}</pre>"
+            log_text = f"<pre>{html.escape(full_log_str)}</pre>"
             
         text = (
             f"📋 <b>Live Execution Logs:</b> <code>{selected_script}</code>\n"
@@ -1629,13 +1690,26 @@ def show_logs_view(chat_id, message_id=None, target_script=None):
             f"{log_text}"
         )
         buttons = [
-            [{"text": "🔄 Refresh Logs", "callback_data": f"show_log_for_{selected_script}"}],
+            [
+                {"text": "🔄 Refresh Logs", "callback_data": f"show_log_for_{selected_script}"},
+                {"text": "📥 Export logs.md", "callback_data": f"export_log_md_{selected_script}"}
+            ],
             [{"text": f"🛑 Stop {selected_script}", "callback_data": f"confirm_stop_prompt_{selected_script}"}, {"text": "🚀 Runner", "callback_data": "menu_runner"}]
         ]
         if len(active) > 1:
             buttons.append([{"text": "📑 Switch Script Logs", "callback_data": "menu_logs_select"}])
         buttons.append([{"text": "🔙 Main Menu", "callback_data": "menu_main"}])
         markup = {"inline_keyboard": buttons}
+        
+        if message_id:
+            edit_tg_message(chat_id, message_id, text, reply_markup=markup)
+        else:
+            send_tg_message(chat_id, text, reply_markup=markup)
+            
+        # If the logs are too big to comfortably fit in Telegram, send logs.md file automatically!
+        if is_too_big and logs:
+            threading.Thread(target=send_logs_markdown_file, args=(chat_id, selected_script), daemon=True).start()
+            
     else:
         # Multiple scripts running: show selector
         text = (
@@ -1650,10 +1724,10 @@ def show_logs_view(chat_id, message_id=None, target_script=None):
         buttons.append([{"text": "🔙 Main Menu", "callback_data": "menu_main"}])
         markup = {"inline_keyboard": buttons}
 
-    if message_id:
-        edit_tg_message(chat_id, message_id, text, reply_markup=markup)
-    else:
-        send_tg_message(chat_id, text, reply_markup=markup)
+        if message_id:
+            edit_tg_message(chat_id, message_id, text, reply_markup=markup)
+        else:
+            send_tg_message(chat_id, text, reply_markup=markup)
 
 def show_files_view(chat_id, message_id=None):
     os.makedirs(SCRIPTS_DIR, exist_ok=True)
@@ -2130,6 +2204,12 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
     elif data == "menu_logs_select":
         answer_callback(callback_id)
         show_logs_view(chat_id, message_id)
+
+    # 7d. Manual Export logs.md
+    elif data.startswith("export_log_md_"):
+        fname = data.replace("export_log_md_", "")
+        answer_callback(callback_id, f"Exporting logs_{os.path.basename(fname).replace('.py', '')}.md...")
+        send_logs_markdown_file(chat_id, fname)
 
     # 8. Files
     elif data == "menu_files":
