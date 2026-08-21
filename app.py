@@ -1145,6 +1145,38 @@ def is_runnable_entry_point(fpath):
         return False
     return True
 
+def detect_project_entry_script(project_dir):
+    """
+    Scans a specific project directory to find the real entry point script.
+    Checks candidate names first, then any non-helper python script,
+    and returns the relative path from SCRIPTS_DIR.
+    """
+    project_py_files = []
+    for root, _, fs in os.walk(project_dir):
+        for f in fs:
+            if f.endswith(".py") and not f.startswith("."):
+                fp = os.path.join(root, f)
+                rel = os.path.relpath(fp, SCRIPTS_DIR)
+                project_py_files.append(rel)
+    
+    if not project_py_files:
+        return None
+
+    # Priority candidate names
+    priority_candidates = ["bot.py", "main.py", "app.py", "run.py", "start.py", "server.py", "telegram_bot.py", "worker.py"]
+    for cand in priority_candidates:
+        for py in project_py_files:
+            if os.path.basename(py).lower() == cand:
+                return py
+
+    # If no standard name found, find the first runnable script that is not a library/helper module
+    for py in project_py_files:
+        if is_runnable_entry_point(py):
+            return py
+
+    # Fallback to the first python file
+    return project_py_files[0]
+
 def get_all_env_candidates(py_filename):
     clean = py_filename.replace("scripts/", "").lstrip("/")
     base_name = os.path.basename(clean)
@@ -1653,19 +1685,7 @@ def show_files_view(chat_id, message_id=None):
                 status_icon = "🟢" if is_this_running else "📦"
                 
                 # Detect entry script for Run button
-                entry_script = None
-                for candidate in ["main.py", "bot.py", "app.py", "run.py", "start.py", "server.py"]:
-                    for rel in inner_files:
-                        if os.path.basename(rel).lower() == candidate:
-                            entry_script = rel
-                            break
-                    if entry_script:
-                        break
-                if not entry_script:
-                    for rel in inner_files:
-                        if rel.endswith(".py") and is_runnable_entry_point(rel):
-                            entry_script = rel
-                            break
+                entry_script = detect_project_entry_script(p)
                             
                 badge_str = f" <i>(📁 {len(inner_files)} files | {total_size} bytes)</i>"
                 file_lines.append(f"• {status_icon} <b>{it}/</b> [Project Archive]{badge_str}{' <b>[RUNNING]</b>' if is_this_running else ''}")
@@ -1674,7 +1694,8 @@ def show_files_view(chat_id, message_id=None):
                 if is_this_running and running_script_name:
                     row_btns.append({"text": "🛑 Stop", "callback_data": f"confirm_stop_prompt_{running_script_name}"})
                 elif entry_script:
-                    row_btns.append({"text": "▶️ Run", "callback_data": f"exec_run_{entry_script}"})
+                    entry_base = os.path.basename(entry_script)
+                    row_btns.append({"text": f"▶️ Run {entry_base}", "callback_data": f"exec_run_{entry_script}"})
                 row_btns.append({"text": "🗑️ Delete", "callback_data": f"file_del_{it}"})
                 download_buttons.append(row_btns)
                 
@@ -2163,17 +2184,39 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
         if not os.path.exists(target_path):
             target_path = os.path.join(WORKSPACE_DIR, fname)
 
+        # 1. Stop if this script or any script inside this folder is running
+        active = get_active_running_processes()
+        for k in list(active.keys()):
+            if k == fname or k.startswith(f"{fname}/") or os.path.basename(k) == fname:
+                stop_child_app(script_name=k, clear_active=True)
+
         if os.path.exists(target_path):
             import shutil
-            if os.path.isdir(target_path):
-                shutil.rmtree(target_path)
-            else:
-                os.remove(target_path)
-            git_sync_to_github(f"Deleted scripts/{fname} via Telegram")
-            answer_callback(callback_id, f"{fname} deleted!", show_alert=True)
+            try:
+                if os.path.isdir(target_path):
+                    shutil.rmtree(target_path, ignore_errors=True)
+                else:
+                    os.remove(target_path)
+            except Exception as e_del:
+                logger.error(f"Error removing {target_path}: {e_del}")
+
+            # Also delete companion files like .env or .requirements.txt
+            base_n = fname.rsplit('.', 1)[0]
+            for extra in [f"{base_n}.requirements.txt", f"{base_n}.env"]:
+                extra_p = os.path.join(SCRIPTS_DIR, extra)
+                if os.path.exists(extra_p):
+                    try:
+                        os.remove(extra_p)
+                    except Exception:
+                        pass
+
+            # Sync to GitHub in background so it never hangs or slows Telegram
+            threading.Thread(target=git_sync_to_github, args=(f"Deleted scripts/{fname} via Telegram",), daemon=True).start()
+            answer_callback(callback_id, f"{fname} deleted successfully!", show_alert=True)
             show_files_view(chat_id, message_id)
         else:
             answer_callback(callback_id, "File not found!", show_alert=True)
+            show_files_view(chat_id, message_id)
 
     # 10c. Delete All Files Prompt
     elif data == "file_del_all_prompt":
@@ -2197,23 +2240,65 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
     elif data == "do_delete_all_files":
         import shutil
         answer_callback(callback_id, "Wiping workspace...")
-        stop_child_app(clear_active=True)
+        
+        # 1. Stop all running child processes cleanly
+        stop_child_app(script_name=None, clear_active=True)
+        time.sleep(0.5)
+        
+        # 2. Reset running processes dictionary in memory
+        running_processes.clear()
+        
+        # 3. Delete all files & directories inside SCRIPTS_DIR safely
+        deleted_count = 0
         try:
             for it in os.listdir(SCRIPTS_DIR):
-                if it != ".gitkeep":
-                    ip = os.path.join(SCRIPTS_DIR, it)
+                if it == ".gitkeep":
+                    continue
+                ip = os.path.join(SCRIPTS_DIR, it)
+                try:
                     if os.path.isdir(ip):
-                        shutil.rmtree(ip)
+                        shutil.rmtree(ip, ignore_errors=True)
                     else:
                         os.remove(ip)
+                    deleted_count += 1
+                except Exception as e_del:
+                    logger.error(f"Error deleting {ip}: {e_del}")
         except Exception as e:
             logger.error(f"Error wiping scripts dir: {e}")
+            
+        # 4. Clean up any virtualenvs (.venvs/)
+        try:
+            if os.path.exists(VENVS_DIR):
+                shutil.rmtree(VENVS_DIR, ignore_errors=True)
+        except Exception:
+            pass
+
+        # 5. Clear all active scripts, config, and vault
+        config["active_scripts"] = []
         config["active_script"] = None
+        config["auto_run_file"] = None
         config["env_vault"] = {}
         save_config(config)
-        git_sync_to_github("Wipe all scripts via Telegram")
-        send_tg_message(chat_id, "✅ <b>Workspace Wiped!</b> All scripts and project archives have been permanently deleted.")
-        show_files_view(chat_id, message_id)
+        
+        # 6. Commit wipe to GitHub in background
+        threading.Thread(target=git_sync_to_github, args=("Wipe all scripts via Telegram",), daemon=True).start()
+        
+        # 7. Edit message in real time to show confirmation
+        wipe_text = (
+            "✅ <b>Workspace Wiped Successfully!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🗑️ Deleted {deleted_count} items (All scripts, projects & databases).\n"
+            "🔴 All running processes terminated.\n\n"
+            "💡 <i>You can send any new .py script or .zip project in chat to deploy!</i>"
+        )
+        markup = {
+            "inline_keyboard": [
+                [{"text": "📤 Upload New Script / ZIP", "callback_data": "menu_upload_prompt"}],
+                [{"text": "📂 View Files", "callback_data": "menu_files"}],
+                [{"text": "🔙 Main Menu", "callback_data": "menu_main"}]
+            ]
+        }
+        edit_tg_message(chat_id, message_id, wipe_text, reply_markup=markup)
 
     # 11. Pip prompt
     elif data == "menu_pip_prompt":
@@ -2334,17 +2419,30 @@ def handle_document_upload(chat_id, user_id, doc):
     # 0b. If uploaded a .zip project archive
     if file_name.endswith(".zip"):
         import zipfile
+        zip_base = file_name[:-4]
         send_tg_message(chat_id, f"📦 <b>Unpacking Project Archive:</b> <code>{file_name}</code>...")
         
         extracted_files = []
+        extracted_project_dir = None
+        
         try:
             with zipfile.ZipFile(scripts_path, 'r') as zip_ref:
-                for member in zip_ref.namelist():
-                    filename_norm = os.path.normpath(member)
-                    if filename_norm.startswith("..") or filename_norm.startswith("/"):
-                        continue
-                    zip_ref.extract(member, SCRIPTS_DIR)
-                    extracted_files.append(member)
+                namelist = zip_ref.namelist()
+                top_dirs = {item.split('/')[0] for item in namelist if item and not item.startswith('/')}
+                
+                # Check if zip contains a single top-level folder
+                if len(top_dirs) == 1 and all(item.startswith(list(top_dirs)[0] + '/') or item == list(top_dirs)[0] for item in namelist):
+                    root_folder_name = list(top_dirs)[0]
+                    zip_ref.extractall(SCRIPTS_DIR)
+                    extracted_files = namelist
+                    extracted_project_dir = os.path.join(SCRIPTS_DIR, root_folder_name)
+                else:
+                    # Flat files: extract into a dedicated project directory named after the zip
+                    target_extract_dir = os.path.join(SCRIPTS_DIR, zip_base)
+                    os.makedirs(target_extract_dir, exist_ok=True)
+                    zip_ref.extractall(target_extract_dir)
+                    extracted_files = namelist
+                    extracted_project_dir = target_extract_dir
             
             try:
                 os.remove(scripts_path)
@@ -2355,43 +2453,27 @@ def handle_document_upload(chat_id, user_id, doc):
             send_tg_message(chat_id, f"❌ Failed to extract zip: {e}")
             return
 
-        # Scan extracted project for entry point, requirements, and env
-        all_py_files = []
+        # Accurately detect the real entry point strictly within THIS project!
+        entry_script = detect_project_entry_script(extracted_project_dir)
+        
+        # Scan for project-specific requirements and .env files
         found_reqs = []
         found_envs = []
-        
-        for root, _, fs in os.walk(SCRIPTS_DIR):
+        for root, _, fs in os.walk(extracted_project_dir):
             for f in fs:
-                rel = os.path.relpath(os.path.join(root, f), SCRIPTS_DIR)
-                if rel.startswith("."):
-                    continue
-                if f.endswith(".py"):
-                    all_py_files.append(rel)
-                elif "requirements" in f.lower() and f.endswith(".txt"):
-                    found_reqs.append(os.path.join(root, f))
+                fp = os.path.join(root, f)
+                if "requirements" in f.lower() and f.endswith(".txt"):
+                    found_reqs.append(fp)
                 elif f.endswith(".env") or f == ".env":
-                    found_envs.append(os.path.join(root, f))
+                    found_envs.append(fp)
 
-        # Detect Primary Entry Point
-        entry_script = None
-        priority_names = ["main.py", "bot.py", "app.py", "run.py", "start.py", "server.py"]
-        for p in priority_names:
-            for py in all_py_files:
-                if os.path.basename(py).lower() == p:
-                    entry_script = py
-                    break
-            if entry_script:
-                break
-        if not entry_script and all_py_files:
-            entry_script = all_py_files[0]
-
-        # Auto-Install Requirements if found
+        # Auto-Install Requirements into this project's isolated virtualenv
         req_installed_count = 0
-        if found_reqs:
+        if found_reqs and entry_script:
             for req in found_reqs:
                 rel_req = os.path.relpath(req, SCRIPTS_DIR)
-                send_tg_message(chat_id, f"⏳ Installing packages from <code>{rel_req}</code>...")
-                subprocess.run([sys.executable, "-m", "pip", "install", "-r", req], capture_output=True, text=True)
+                send_tg_message(chat_id, f"⏳ Installing packages from <code>{rel_req}</code> into isolated environment...")
+                check_and_install_reqs(req, clean_name=entry_script)
                 with open(req, "r", encoding="utf-8", errors="ignore") as rf:
                     req_installed_count += len([l for l in rf if l.strip() and not l.startswith("#")])
 
@@ -2414,12 +2496,13 @@ def handle_document_upload(chat_id, user_id, doc):
 
         git_sync_to_github(f"Deploy ZIP project: {file_name}")
 
+        entry_display = entry_script or 'None'
         deploy_msg = (
             f"🚀 <b>ZIP Project Deployed Successfully!</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📦 <b>Archive:</b> <code>{file_name}</code>\n"
             f"📁 <b>Files Extracted:</b> {len(extracted_files)}\n"
-            f"🎯 <b>Detected Entry Script:</b> <code>{entry_script or 'None'}</code>\n"
+            f"🎯 <b>Detected Entry Script:</b> <code>{entry_display}</code>\n"
             f"📦 <b>Dependencies:</b> {'Installed ~' + str(req_installed_count) + ' packages' if found_reqs else 'No requirements.txt found'}\n"
             f"🔒 <b>Environment:</b> {str(env_loaded_count) + ' variables loaded' if env_loaded_count else 'No .env found'}\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2530,7 +2613,7 @@ def handle_document_upload(chat_id, user_id, doc):
 # Polling Engine
 # ---------------------------------------------------------------------------
 def telegram_polling_loop():
-    logger.info("🤖 Telegram Polling Engine active...")
+    logger.info("🤖 Real-Time Telegram Polling Engine active...")
     offset = 0
     
     while IS_RUNNING:
@@ -2544,7 +2627,7 @@ def telegram_polling_loop():
                     for update in data.get("result", []):
                         offset = update["update_id"] + 1
                         
-                        # Handle Callback Queries (Button Clicks)
+                        # Handle Callback Queries (Button Clicks) in non-blocking real-time thread
                         if "callback_query" in update:
                             cq = update["callback_query"]
                             cb_id = cq["id"]
@@ -2552,9 +2635,13 @@ def telegram_polling_loop():
                             c_chat = cq["message"]["chat"]["id"]
                             c_msg_id = cq["message"]["message_id"]
                             c_data = cq.get("data", "")
-                            handle_callback_query(cb_id, c_chat, c_user, c_msg_id, c_data)
+                            threading.Thread(
+                                target=handle_callback_query,
+                                args=(cb_id, c_chat, c_user, c_msg_id, c_data),
+                                daemon=True
+                            ).start()
                         
-                        # Handle Normal Messages
+                        # Handle Normal Messages in non-blocking real-time thread
                         elif "message" in update:
                             msg = update["message"]
                             chat_id = msg.get("chat", {}).get("id")
@@ -2564,13 +2651,20 @@ def telegram_polling_loop():
                                 continue
                             
                             if "text" in msg:
-                                handle_text_message(chat_id, user_id, msg["text"])
+                                threading.Thread(
+                                    target=handle_text_message,
+                                    args=(chat_id, user_id, msg["text"]),
+                                    daemon=True
+                                ).start()
                             elif "document" in msg:
-                                handle_document_upload(chat_id, user_id, msg["document"])
-            time.sleep(0.5)
+                                threading.Thread(
+                                    target=handle_document_upload,
+                                    args=(chat_id, user_id, msg["document"]),
+                                    daemon=True
+                                ).start()
         except Exception as e:
             logger.error(f"Telegram polling error: {e}")
-            time.sleep(3)
+            time.sleep(2)
 
 # ---------------------------------------------------------------------------
 # Main Orchestrator & Auto-Runner
