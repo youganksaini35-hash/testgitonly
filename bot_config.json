@@ -3,9 +3,7 @@
     7249511572,
     7251749429
   ],
-  "active_scripts": [
-    "bot/bot.py"
-  ],
+  "active_scripts": [],
   "auto_run_file": "bot/bot.py",
   "env_vault": {
     "bot/bot.py": "lx37SKX8p/cakUD0dSvUjOnvUC/BT7QwE5QpDQPg5pmQ++LHjgKwW02CRjx1ljidn+4ecyQWT1EODxI91H85wveUDp7XVkrtfvB2RCpfkyxCv9F1Mt+fcF4D8B6QOek/qor0l2NVWO6GZLrQ1fmMO6E+9uqyfdZrqo5/euSQUQzndbv+LYMrQRrxbPT9oShFVQA1P9Qp7wbBn2C57Ju2H4POFaWViximvLnBqiygfNjALoC92QGpN+uyiC6mg4IM0MQLLXWOLADhneDo7l+tRx+7k8VmJpeQwMgnGgSlD8CKytRRPpvShk5LokdEL4AKBDkzd+v9TkXauhK4R0Z905laO2cIElrD3qtaGXA8m4zl4zYwhmF+5L93Nalxvp+K6iG5nV93+zo868Rjj2KXLqXFVPPdKvPZ62iVVSM8nr0tEw9gvO8I0j6e7jcUcECKzMcf4FitW7kzRPdKU5UVr9hsPRGj2DKeEAXlLSTJsNO7l04QBOCd65yQjZhNdT2YevtudNqh6xtkz7cjubOoyme9A2bXoxSsy1ppRJyIkU+Pq0oc7p6ZQP2rDtkStcvrI8+MsLsckuv82u34QLResTmZAeLkvPX8aDvqv1Dam5rgpa40enz4MU6WFb6aTH6vJjr6qo6zZim5cqMdOCdym6lUARoyEnG9keZtBciACdb+nj+0GR5hB63UPsAfMMTH3HW6DlfNbIL0N1MnOsSbpt3l0+aXklTL4KzVxGdW5FgxV6eV",
