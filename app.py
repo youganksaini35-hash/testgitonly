@@ -1820,7 +1820,7 @@ def show_files_view(chat_id, message_id=None):
     download_buttons.append([{"text": "📤 Upload New Script / ZIP", "callback_data": "menu_upload_prompt"}])
     download_buttons.append([{"text": "🚀 Scripts Runner", "callback_data": "menu_runner"}])
     if top_items:
-        download_buttons.append([{"text": "💣 Delete All Scripts & Projects", "callback_data": "file_del_all_prompt"}])
+        download_buttons.append([{"text": "💣 Delete All Scripts & Projects", "callback_data": "wipe_all_workspace_prompt"}])
     download_buttons.append([{"text": "🔙 Main Menu", "callback_data": "menu_main"}])
     markup = {"inline_keyboard": download_buttons[:90]} # Keep under TG inline keyboard limit
     
@@ -2240,66 +2240,8 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
         else:
             answer_callback(callback_id, "File not found!", show_alert=True)
 
-    # 10. Delete File/Folder Prompt (Confirmation)
-    elif data.startswith("file_del_"):
-        fname = data.replace("file_del_", "")
-        answer_callback(callback_id)
-        text = (
-            f"⚠️ <b>Confirm Deletion</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Are you sure you want to permanently delete <code>scripts/{fname}</code>?"
-        )
-        markup = {
-            "inline_keyboard": [
-                [{"text": f"🗑️ Yes, Delete {fname}", "callback_data": f"do_delete_file_{fname}"}],
-                [{"text": "❌ Cancel", "callback_data": "menu_files"}]
-            ]
-        }
-        edit_tg_message(chat_id, message_id, text, reply_markup=markup)
-
-    # 10b. Do Delete File/Folder Execution
-    elif data.startswith("do_delete_file_"):
-        fname = data.replace("do_delete_file_", "")
-        target_path = os.path.join(SCRIPTS_DIR, fname)
-        if not os.path.exists(target_path):
-            target_path = os.path.join(WORKSPACE_DIR, fname)
-
-        # 1. Stop if this script or any script inside this folder is running
-        active = get_active_running_processes()
-        for k in list(active.keys()):
-            if k == fname or k.startswith(f"{fname}/") or os.path.basename(k) == fname:
-                stop_child_app(script_name=k, clear_active=True)
-
-        if os.path.exists(target_path):
-            import shutil
-            try:
-                if os.path.isdir(target_path):
-                    shutil.rmtree(target_path, ignore_errors=True)
-                else:
-                    os.remove(target_path)
-            except Exception as e_del:
-                logger.error(f"Error removing {target_path}: {e_del}")
-
-            # Also delete companion files like .env or .requirements.txt
-            base_n = fname.rsplit('.', 1)[0]
-            for extra in [f"{base_n}.requirements.txt", f"{base_n}.env"]:
-                extra_p = os.path.join(SCRIPTS_DIR, extra)
-                if os.path.exists(extra_p):
-                    try:
-                        os.remove(extra_p)
-                    except Exception:
-                        pass
-
-            # Sync to GitHub in background so it never hangs or slows Telegram
-            threading.Thread(target=git_sync_to_github, args=(f"Deleted scripts/{fname} via Telegram",), daemon=True).start()
-            answer_callback(callback_id, f"{fname} deleted successfully!", show_alert=True)
-            show_files_view(chat_id, message_id)
-        else:
-            answer_callback(callback_id, "File not found!", show_alert=True)
-            show_files_view(chat_id, message_id)
-
-    # 10c. Delete All Files Prompt
-    elif data == "file_del_all_prompt":
+    # 10a. Delete All Workspace Prompt
+    elif data in ["wipe_all_workspace_prompt", "file_del_all_prompt"]:
         answer_callback(callback_id)
         text = (
             "💣 <b>Confirm Complete Workspace Wipe</b>\n"
@@ -2310,14 +2252,14 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
         )
         markup = {
             "inline_keyboard": [
-                [{"text": "💣 Yes, Delete Everything", "callback_data": "do_delete_all_files"}],
+                [{"text": "💣 Yes, Delete Everything", "callback_data": "do_wipe_all_workspace"}],
                 [{"text": "❌ Cancel", "callback_data": "menu_files"}]
             ]
         }
         edit_tg_message(chat_id, message_id, text, reply_markup=markup)
 
-    # 10d. Do Delete All Files Execution
-    elif data == "do_delete_all_files":
+    # 10b. Do Delete All Files Execution
+    elif data in ["do_wipe_all_workspace", "do_delete_all_files"]:
         import shutil
         answer_callback(callback_id, "Wiping workspace...")
         
@@ -2379,6 +2321,64 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
             ]
         }
         edit_tg_message(chat_id, message_id, wipe_text, reply_markup=markup)
+
+    # 10c. Delete Single File/Folder Prompt (Confirmation)
+    elif data.startswith("file_del_") and not data.startswith("file_del_all"):
+        fname = data.replace("file_del_", "")
+        answer_callback(callback_id)
+        text = (
+            f"⚠️ <b>Confirm Deletion</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Are you sure you want to permanently delete <code>scripts/{fname}</code>?"
+        )
+        markup = {
+            "inline_keyboard": [
+                [{"text": f"🗑️ Yes, Delete {fname}", "callback_data": f"do_delete_file_{fname}"}],
+                [{"text": "❌ Cancel", "callback_data": "menu_files"}]
+            ]
+        }
+        edit_tg_message(chat_id, message_id, text, reply_markup=markup)
+
+    # 10d. Do Delete Single File/Folder Execution
+    elif data.startswith("do_delete_file_") and not data.startswith("do_delete_all_files"):
+        fname = data.replace("do_delete_file_", "")
+        target_path = os.path.join(SCRIPTS_DIR, fname)
+        if not os.path.exists(target_path):
+            target_path = os.path.join(WORKSPACE_DIR, fname)
+
+        # 1. Stop if this script or any script inside this folder is running
+        active = get_active_running_processes()
+        for k in list(active.keys()):
+            if k == fname or k.startswith(f"{fname}/") or os.path.basename(k) == fname:
+                stop_child_app(script_name=k, clear_active=True)
+
+        if os.path.exists(target_path):
+            import shutil
+            try:
+                if os.path.isdir(target_path):
+                    shutil.rmtree(target_path, ignore_errors=True)
+                else:
+                    os.remove(target_path)
+            except Exception as e_del:
+                logger.error(f"Error removing {target_path}: {e_del}")
+
+            # Also delete companion files like .env or .requirements.txt
+            base_n = fname.rsplit('.', 1)[0]
+            for extra in [f"{base_n}.requirements.txt", f"{base_n}.env"]:
+                extra_p = os.path.join(SCRIPTS_DIR, extra)
+                if os.path.exists(extra_p):
+                    try:
+                        os.remove(extra_p)
+                    except Exception:
+                        pass
+
+            # Sync to GitHub in background so it never hangs or slows Telegram
+            threading.Thread(target=git_sync_to_github, args=(f"Deleted scripts/{fname} via Telegram",), daemon=True).start()
+            answer_callback(callback_id, f"{fname} deleted successfully!", show_alert=True)
+            show_files_view(chat_id, message_id)
+        else:
+            answer_callback(callback_id, "File not found!", show_alert=True)
+            show_files_view(chat_id, message_id)
 
     # 11. Pip prompt
     elif data == "menu_pip_prompt":
