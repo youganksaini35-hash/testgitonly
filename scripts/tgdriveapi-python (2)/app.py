@@ -1,4 +1,5 @@
 import os
+import sys
 import io
 import re
 import json
@@ -7,6 +8,43 @@ import struct
 import shutil
 import asyncio
 import subprocess
+
+# Auto-Install Missing Dependencies on First Launch
+REQUIRED_PACKAGES = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "telethon>=1.38.0",
+    "tgcrypto>=1.2.5",
+    "python-multipart>=0.0.20",
+    "httpx>=0.28.0",
+    "python-dotenv>=1.0.0"
+]
+
+def ensure_dependencies():
+    missing = []
+    checks = {
+        "fastapi": "fastapi",
+        "uvicorn": "uvicorn",
+        "telethon": "telethon",
+        "multipart": "python-multipart",
+        "httpx": "httpx"
+    }
+    for mod, pkg in checks.items():
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(pkg)
+
+    if missing:
+        print(f"📦 [Auto-Installer] Missing packages detected: {missing}. Installing dependencies automatically...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-cache-dir", *REQUIRED_PACKAGES])
+            print("✅ [Auto-Installer] Dependencies installed successfully!")
+        except Exception as e:
+            print(f"⚠️ [Auto-Installer Warning] Automatic pip install failed: {e}")
+
+ensure_dependencies()
+
 from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Any
 
