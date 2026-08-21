@@ -18,6 +18,7 @@ from database import (
     set_user_folder,
     reset_user_folder,
     add_user_folder,
+    sync_user_folders,
     get_user_folders,
     get_folder_by_id,
     delete_user_folder,
@@ -119,6 +120,27 @@ async def get_cached_or_fetch_files(api_key: str, user_id: int, force_refresh: b
         file_cache.set(user_id, items)
         return items
     return []
+
+async def get_live_folder_info(api_key: str, user_id: int, folder_id: str):
+    """Retrieve folder information directly from live Telegram Saved Messages API in real-time."""
+    if folder_id in ("root", "all", None):
+        return {"id": "root", "name": "Root (Saved Messages)", "parent_id": None}
+    
+    try:
+        res = await list_folders(api_key, parent_id="all")
+        folders = res.get("folders", []) or res.get("items", [])
+        for f in folders:
+            f_id = str(f.get("id") or f.get("message_id"))
+            if f_id == str(folder_id):
+                return {
+                    "id": f_id,
+                    "name": f.get("name", f_id),
+                    "parent_id": f.get("parentId") or f.get("parent_id") or "root"
+                }
+    except Exception as e:
+        logger.warning(f"Error fetching live folder info: {e}")
+    
+    return get_folder_by_id(user_id, folder_id)
 
 def build_download_url(file_id: str, api_key: str = None) -> str:
     """Build high-speed direct download link with API key parameter for browser/downloader compatibility."""
@@ -437,26 +459,27 @@ async def text_handler(event):
 
         status_msg = await event.respond(build_loading_card("➕ Creating Folder", 50.0, f"Creating folder '{clean_html(folder_name)}'..."), parse_mode="html")
         
-        # 1. Generate clean folder ID & store in SQLite
-        folder_id = f"f_{int(time.time())}_{user_id % 1000}"
-        add_user_folder(user_id, folder_id, folder_name, parent_id)
-
-        # 2. Sync with remote TG Drive API
+        # 1. Create folder in Telegram Saved Messages via TG Drive API
+        custom_folders = []
         try:
             res = await create_folder(api_key, folder_name, parent_id=parent_id)
-            if res.get("status") == "success" and res.get("data", {}).get("id"):
-                remote_id = res["data"]["id"]
-                add_user_folder(user_id, remote_id, folder_name, parent_id)
-                folder_id = remote_id
+            if res.get("status") in ("success", 200, 201):
+                folders_res = await list_folders(api_key, parent_id=parent_id)
+                custom_folders = folders_res.get("folders") or folders_res.get("items") or []
+                sync_user_folders(user_id, custom_folders)
+            else:
+                add_user_folder(user_id, f"f_{int(time.time())}", folder_name, parent_id)
+                custom_folders = get_user_folders(user_id, parent_id=parent_id)
         except Exception as e:
             logger.warning(f"Remote folder creation sync: {e}")
+            add_user_folder(user_id, f"f_{int(time.time())}", folder_name, parent_id)
+            custom_folders = get_user_folders(user_id, parent_id=parent_id)
 
         # Invalidate cache
         file_cache.invalidate(user_id)
 
         await status_msg.edit(f"✅ <b>Folder '{clean_html(folder_name)}' successfully created!</b>", parse_mode="html")
 
-        custom_folders = get_user_folders(user_id, parent_id=parent_id)
         cur_f_id, cur_f_name = get_user_folder(user_id)
         stats = await get_storage_stats_realtime(api_key)
         category_counts = stats.get("category_breakdown", {})
@@ -760,7 +783,7 @@ async def callback_handler(event):
             await event.edit(build_loading_card("📁 Loading TG Drive Files", 50.0, "Fetching 475+ files from Telegram Cloud..."), parse_mode="html")
 
         try:
-            all_items = await get_cached_or_fetch_files(api_key, user_id)
+            all_items = await get_cached_or_fetch_files(api_key, user_id, force_refresh=True)
             
             # Filter by category if requested
             folder_title = "All Files"
@@ -770,11 +793,19 @@ async def callback_handler(event):
                 filtered_items = [f for f in all_items if categorize_file(f) == target_cat]
                 folder_title = f"{target_cat.capitalize()}"
             elif folder_id != "all" and folder_id != "root":
-                folder_meta = get_folder_by_id(user_id, folder_id)
-                f_files = set(get_files_in_folder(user_id, folder_id))
-                filtered_items = [f for f in all_items if f.get("folder_id") == folder_id or str(f.get("id")) in f_files or str(f.get("message_id")) in f_files]
+                folder_meta = await get_live_folder_info(api_key, user_id, folder_id)
                 folder_name = folder_meta["name"] if folder_meta else folder_id
                 folder_title = f"Folder: {folder_name}"
+                filtered_items = [
+                    f for f in all_items 
+                    if str(f.get("parentId") or f.get("parent_id") or f.get("folder_id")) == str(folder_id)
+                ]
+            elif folder_id == "root":
+                folder_title = "Root (Saved Messages)"
+                filtered_items = [
+                    f for f in all_items 
+                    if not f.get("parentId") or f.get("parentId") in ("root", "", None) or f.get("folder_id") in ("root", "", None)
+                ]
 
             total_items = len(filtered_items)
 
@@ -916,14 +947,17 @@ async def callback_handler(event):
         page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 1
         
         custom_folders = get_user_folders(user_id)
+        # Fetch live folders directly from API
+        custom_folders = []
         try:
             api_folders_res = await list_folders(api_key, parent_id="root")
-            if api_folders_res.get("status") == "success":
-                for af in api_folders_res.get("folders", []):
-                    add_user_folder(user_id, str(af.get("id")), af.get("name"))
+            if api_folders_res.get("status") in ("success", 200, 201):
+                custom_folders = api_folders_res.get("folders") or api_folders_res.get("items") or []
+                sync_user_folders(user_id, custom_folders)
+            else:
                 custom_folders = get_user_folders(user_id)
         except Exception:
-            pass
+            custom_folders = get_user_folders(user_id)
 
         text = (
             f"📦 <b>Move File #{file_id} to Folder</b>\n\n"
@@ -943,10 +977,9 @@ async def callback_handler(event):
 
         try:
             res = await move_file(api_key, file_id, target_folder_id)
-            set_file_folder(user_id, file_id, target_folder_id)
             file_cache.invalidate(user_id)
             
-            target_meta = get_folder_by_id(user_id, target_folder_id)
+            target_meta = await get_live_folder_info(api_key, user_id, target_folder_id)
             target_name = target_meta["name"] if target_meta else ("Root" if target_folder_id == "root" else target_folder_id)
             await event.answer(f"✅ Moved to '{target_name}'!", alert=True)
             
@@ -980,7 +1013,7 @@ async def callback_handler(event):
     if data.startswith("fren_fold_ask:"):
         await event.answer()
         folder_id = data.split(":")[1]
-        folder_meta = get_folder_by_id(user_id, folder_id)
+        folder_meta = await get_live_folder_info(api_key, user_id, folder_id)
         folder_name = folder_meta["name"] if folder_meta else folder_id
         set_user_state(user_id, "AWAITING_FOLDER_RENAME", {"folder_id": folder_id})
         await event.edit(
@@ -1025,27 +1058,24 @@ async def callback_handler(event):
             await event.edit(f"❌ Error: {clean_html(str(e))}", buttons=back_to_main_kb(), parse_mode="html")
         return
 
-    # Folders Menu (with instant loading indicator)
+    # Folders Menu (with live real-time API sync)
     if data.startswith("menu_folders:"):
         await event.answer("📂 Loading Folders...")
         parts = data.split(":")
         parent_id = parts[1] if len(parts) > 1 else "root"
         
-        # 1. Fetch custom folders from database
-        custom_folders = get_user_folders(user_id, parent_id=parent_id)
-
-        # 2. Also merge any folders from API
+        # 1. Fetch live folders from API directly (100% synced with Web App)
+        custom_folders = []
         try:
             api_folders_res = await list_folders(api_key, parent_id=parent_id)
-            if api_folders_res.get("status") == "success":
-                for af in api_folders_res.get("folders", []):
-                    af_id = str(af.get("id"))
-                    af_name = af.get("name")
-                    if af_name:
-                        add_user_folder(user_id, af_id, af_name, parent_id)
+            if api_folders_res.get("status") in ("success", 200, 201):
+                custom_folders = api_folders_res.get("folders") or api_folders_res.get("items") or []
+                sync_user_folders(user_id, custom_folders)
+            else:
                 custom_folders = get_user_folders(user_id, parent_id=parent_id)
-        except Exception:
-            pass
+        except Exception as ex:
+            logger.warning(f"Live folder fetch error: {ex}")
+            custom_folders = get_user_folders(user_id, parent_id=parent_id)
 
         try:
             cur_f_id, cur_f_name = get_user_folder(user_id)
@@ -1054,7 +1084,7 @@ async def callback_handler(event):
             
             target_str = f"📁 {clean_html(cur_f_name)} 🎯" if cur_f_id != "root" else "Root (Saved Messages)"
             text = (
-                f"📂 <b>FOLDERS & CATEGORIES</b>\n\n"
+                f"📂 <b>FOLDERS & CATEGORIES</b> (Live Real-Time Sync)\n\n"
                 f"🎯 <b>Active Target:</b> {target_str}\n\n"
                 f"<i>Kissi bhi folder par click karke use Default Target set karein ya uski files browse karein:</i>\n"
             )
@@ -1069,6 +1099,13 @@ async def callback_handler(event):
         parts = data.split(":")
         folder_id = parts[1]
         folder_meta = get_folder_by_id(user_id, folder_id)
+        if not folder_meta:
+            try:
+                folders_res = await list_folders(api_key, parent_id="root")
+                sync_user_folders(user_id, folders_res.get("folders", []) or folders_res.get("items", []))
+                folder_meta = get_folder_by_id(user_id, folder_id)
+            except Exception:
+                pass
         folder_name = folder_meta["name"] if folder_meta else (parts[2] if len(parts) > 2 else folder_id)
         
         cur_f_id, _ = get_user_folder(user_id)
@@ -1087,6 +1124,13 @@ async def callback_handler(event):
         parts = data.split(":")
         folder_id = parts[1]
         folder_meta = get_folder_by_id(user_id, folder_id)
+        if not folder_meta:
+            try:
+                folders_res = await list_folders(api_key, parent_id="root")
+                sync_user_folders(user_id, folders_res.get("folders", []) or folders_res.get("items", []))
+                folder_meta = get_folder_by_id(user_id, folder_id)
+            except Exception:
+                pass
         folder_name = folder_meta["name"] if folder_meta else (parts[2] if len(parts) > 2 else folder_id)
         
         set_user_folder(user_id, folder_id, folder_name)
@@ -1121,7 +1165,7 @@ async def callback_handler(event):
     if data.startswith("fdel_confirm:") or data.startswith("folder_del_confirm:"):
         await event.answer()
         folder_id = data.split(":")[1]
-        folder_meta = get_folder_by_id(user_id, folder_id)
+        folder_meta = await get_live_folder_info(api_key, user_id, folder_id)
         folder_name = folder_meta["name"] if folder_meta else folder_id
         buttons = [
             [Button.inline("✅ Yes, Delete Folder", f"fdel_do:{folder_id}".encode('utf-8'))],
@@ -1135,15 +1179,12 @@ async def callback_handler(event):
         await event.answer()
         folder_id = data.split(":")[1]
         try:
+            del_res = await delete_folder(api_key, folder_id)
             delete_user_folder(user_id, folder_id)
-            try:
-                await delete_folder(api_key, folder_id)
-            except Exception:
-                pass
             cur_f_id, _ = get_user_folder(user_id)
             if cur_f_id == folder_id:
                 reset_user_folder(user_id)
-            await event.edit("✅ <b>Folder successfully deleted!</b>", buttons=back_to_main_kb(), parse_mode="html")
+            await event.edit("✅ <b>Folder successfully deleted from TG Drive!</b>", buttons=back_to_main_kb(), parse_mode="html")
         except Exception as e:
             await event.edit(f"❌ Error: {clean_html(str(e))}", buttons=back_to_main_kb(), parse_mode="html")
         return

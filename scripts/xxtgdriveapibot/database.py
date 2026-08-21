@@ -99,6 +99,23 @@ def delete_user_api_key(user_id: int):
     conn.commit()
     conn.close()
 
+def sync_user_folders(user_id: int, folders_list: list):
+    """Clean and sync local folders with live folders from Telegram Saved Messages API."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM folders WHERE user_id = ?", (user_id,))
+    for f in folders_list:
+        f_id = str(f.get("id") or f.get("message_id"))
+        f_name = f.get("name")
+        p_id = str(f.get("parentId") or f.get("parent_id") or "root")
+        if f_id and f_name:
+            cursor.execute("""
+                INSERT OR REPLACE INTO folders (folder_id, user_id, name, parent_id)
+                VALUES (?, ?, ?, ?)
+            """, (f_id, user_id, f_name.strip(), p_id))
+    conn.commit()
+    conn.close()
+
 def add_user_folder(user_id: int, folder_id: str, name: str, parent_id: str = "root"):
     """Add or update a custom folder in the database."""
     conn = get_connection()
