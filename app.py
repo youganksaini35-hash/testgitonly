@@ -52,11 +52,21 @@ LOG_BUFFER_MAX = 200
 user_states = {}
 
 def get_active_running_processes():
-    """Returns dict of currently active running processes."""
+    """Returns dict of currently active running processes, strictly pruning dead PIDs and zombies."""
     active = {}
     for name, pdata in list(running_processes.items()):
         proc = pdata.get("proc")
+        pid = pdata.get("pid")
+        is_alive = False
         if proc and proc.poll() is None:
+            if pid and psutil.pid_exists(pid):
+                try:
+                    p = psutil.Process(pid)
+                    if p.status() != psutil.STATUS_ZOMBIE:
+                        is_alive = True
+                except Exception:
+                    pass
+        if is_alive:
             active[name] = pdata
         else:
             running_processes.pop(name, None)
@@ -712,32 +722,75 @@ def start_child_app(filename="bot.py"):
         return False, f"❌ Start error: {e}"
 
 def stop_child_app(script_name=None, clear_active=True):
-    """Stops a specific script or all running scripts."""
+    """Stops a specific script, a project folder, or all running scripts."""
     stopped_names = []
-    targets = [script_name] if script_name else list(running_processes.keys())
     
+    if not script_name:
+        targets = list(running_processes.keys())
+    else:
+        clean_target = script_name.replace("scripts/", "").lstrip("/")
+        base_target = os.path.basename(clean_target)
+        zip_stem = clean_target[:-4] if clean_target.endswith(".zip") else clean_target
+        
+        targets = []
+        for k in list(running_processes.keys()):
+            if (
+                k == clean_target
+                or k == script_name
+                or k == zip_stem
+                or k.startswith(f"{clean_target}/")
+                or k.startswith(f"{zip_stem}/")
+                or os.path.basename(k) == base_target
+                or os.path.basename(k) == clean_target
+                or os.path.dirname(k) == clean_target
+                or os.path.dirname(k) == zip_stem
+            ):
+                targets.append(k)
+        if not targets and clean_target in running_processes:
+            targets.append(clean_target)
+
     for name in targets:
         pdata = running_processes.get(name)
         if pdata:
             pdata["is_stopped"] = True
             proc = pdata.get("proc")
-            if proc and proc.poll() is None:
-                pid = proc.pid
+            if proc:
                 try:
-                    parent = psutil.Process(pid)
-                    for child in parent.children(recursive=True):
-                        try:
-                            child.kill()
-                        except Exception:
-                            pass
-                    parent.kill()
-                except Exception:
+                    pid = proc.pid
                     try:
-                        proc.kill()
+                        parent = psutil.Process(pid)
+                        for child in parent.children(recursive=True):
+                            try:
+                                child.kill()
+                            except Exception:
+                                pass
+                        parent.kill()
                     except Exception:
                         pass
-                stopped_names.append(name)
+                    try:
+                        proc.kill()
+                        proc.terminate()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            stopped_names.append(name)
             running_processes.pop(name, None)
+
+    # OS-level sweep for leftover processes matching targets
+    if script_name and stopped_names:
+        for sname in stopped_names:
+            try:
+                base = os.path.basename(sname)
+                for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+                    try:
+                        cmd = p.info.get('cmdline') or []
+                        if cmd and any(base in arg for arg in cmd) and p.pid != os.getpid():
+                            p.kill()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
     if clear_active:
         active_list = list(get_active_running_processes().keys())
@@ -2071,7 +2124,13 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
     # 4. Execute a specific file
     elif data.startswith("exec_run_"):
         fname = data.replace("exec_run_", "")
-        answer_callback(callback_id, f"Starting {fname}...")
+        active = get_active_running_processes()
+        if fname in active:
+            answer_callback(callback_id, f"Reloading {fname} with latest code...")
+            stop_child_app(script_name=fname, clear_active=False)
+            time.sleep(0.5)
+        else:
+            answer_callback(callback_id, f"Starting {fname}...")
         ok, msg = start_child_app(fname)
         send_tg_message(chat_id, msg, reply_markup=get_main_menu_keyboard())
 
@@ -2500,6 +2559,14 @@ def handle_document_upload(chat_id, user_id, doc):
     if file_name.endswith(".zip"):
         import zipfile
         zip_base = file_name[:-4]
+        
+        # Stop any existing running instance of this project so newly uploaded code is deployed cleanly!
+        active = get_active_running_processes()
+        is_zip_running = any(k.startswith(f"{zip_base}/") or k == zip_base or os.path.dirname(k) == zip_base for k in active.keys())
+        if is_zip_running:
+            stop_child_app(script_name=zip_base, clear_active=False)
+            time.sleep(0.5)
+
         send_tg_message(chat_id, f"📦 <b>Unpacking Project Archive:</b> <code>{file_name}</code>...")
         
         extracted_files = []
