@@ -1543,21 +1543,33 @@ def mask_secret_val(val):
 
 def prompt_env_script_select(chat_id, user_id, message_id=None):
     os.makedirs(SCRIPTS_DIR, exist_ok=True)
-    files = sorted([f for f in os.listdir(SCRIPTS_DIR) if f.endswith(".py")])
     
+    # Scan all Python files recursively across scripts/ and projects
+    all_files = []
+    for root, _, fs in os.walk(SCRIPTS_DIR):
+        for f in fs:
+            if f.endswith(".py") and not f.startswith("."):
+                rel = os.path.relpath(os.path.join(root, f), SCRIPTS_DIR).replace("\\", "/")
+                all_files.append(rel)
+    all_files.sort()
+    
+    files = [f for f in all_files if is_runnable_entry_point(f)]
+    if not files and all_files:
+        files = all_files
+
     buttons = []
     if not files:
         text = (
             "⚙️ <b>Per-Script Environment (.env) Manager</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "📁 No Python scripts found in <code>scripts/</code> folder.\n\n"
-            "💡 <i>Send a new script (.py) in chat to add one.</i>"
+            "💡 <i>Send a new script (.py) or ZIP project in chat to add one.</i>"
         )
     else:
         text = (
             "⚙️ <b>Per-Script Environment (.env) Manager</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Each script has its own private <b><code>.env</code></b> file loaded on launch.\n\n"
+            "Each script/project has its own private <b><code>.env</code></b> vault loaded on launch.\n\n"
             "<i>Select a script below to view & manage its variables:</i>"
         )
         for py in files:
@@ -1575,7 +1587,8 @@ def prompt_env_script_select(chat_id, user_id, message_id=None):
 
 def prompt_script_env_dashboard(chat_id, user_id, py_filename, message_id=None):
     env_vars = read_script_env(py_filename)
-    is_this_running = (child_process and child_process.poll() is None and child_process_name == py_filename)
+    active = get_active_running_processes()
+    is_this_running = py_filename in active
     
     var_lines = []
     if not env_vars:
@@ -1605,7 +1618,7 @@ def prompt_script_env_dashboard(chat_id, user_id, py_filename, message_id=None):
         ]
     ]
     if is_this_running:
-        buttons.append([{"text": "🔄 Apply & Restart Script", "callback_data": "menu_restart"}])
+        buttons.append([{"text": "🔄 Apply & Restart Script", "callback_data": f"exec_run_{py_filename}"}])
     else:
         buttons.append([{"text": f"▶️ Run {py_filename} Now", "callback_data": f"exec_run_{py_filename}"}])
     
