@@ -211,23 +211,39 @@ async def upload_file_chunked(
     if not upload_id:
         return await upload_file_streaming_direct(api_key, file_path, filename, folder_id, mime_type, progress_cb)
 
-    # 2. Upload Chunks (25MB each)
+    # 2. Upload Chunks (25MB each) with live real-time 512KB sub-progress
     chunk_url = f"{API_BASE_URL}/v1/files/upload/chunk"
     uploaded_bytes = 0
 
-    timeout = aiohttp.ClientTimeout(total=600)
+    timeout = aiohttp.ClientTimeout(total=900)
     async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
         with open(file_path, 'rb') as f:
             for chunk_idx in range(total_chunks):
-                chunk_data = f.read(chunk_size_bytes)
-                if not chunk_data:
-                    break
+                slice_len = min(chunk_size_bytes, total_size - (chunk_idx * chunk_size_bytes))
+                
+                async def chunk_stream_generator(file_handle, length):
+                    nonlocal uploaded_bytes
+                    read_in_part = 0
+                    sub_slice = 512 * 1024  # 512 KB
+                    while read_in_part < length:
+                        to_read = min(sub_slice, length - read_in_part)
+                        part = file_handle.read(to_read)
+                        if not part:
+                            break
+                        read_in_part += len(part)
+                        uploaded_bytes += len(part)
+                        if progress_cb:
+                            try:
+                                await progress_cb(uploaded_bytes, total_size)
+                            except Exception:
+                                pass
+                        yield part
 
                 form = aiohttp.FormData()
                 form.add_field('upload_id', str(upload_id))
                 form.add_field('chunk_index', str(chunk_idx))
                 form.add_field('total_chunks', str(total_chunks))
-                form.add_field('chunk', chunk_data, filename=f"part_{chunk_idx}_{filename}", content_type="application/octet-stream")
+                form.add_field('chunk', chunk_stream_generator(f, slice_len), filename=f"part_{chunk_idx}_{filename}", content_type="application/octet-stream")
 
                 try:
                     async with session.post(chunk_url, data=form) as c_resp:
@@ -238,13 +254,6 @@ async def upload_file_chunked(
                 except Exception as e:
                     await abort_chunked_upload(api_key, upload_id)
                     return {"status": "error", "message": f"Chunk {chunk_idx + 1} upload error: {str(e)}"}
-
-                uploaded_bytes += len(chunk_data)
-                if progress_cb:
-                    try:
-                        await progress_cb(uploaded_bytes, total_size)
-                    except Exception:
-                        pass
 
     # 3. Complete Upload Session
     complete_url = f"{API_BASE_URL}/v1/files/upload/complete"

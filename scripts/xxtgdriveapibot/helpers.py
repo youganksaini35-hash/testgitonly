@@ -107,7 +107,7 @@ def build_loading_card(title: str, percent: float, status_text: str = "Loading..
     )
 
 class ProgressTracker:
-    """Throttled progress tracker to avoid Telegram FloodWait."""
+    """Throttled progress tracker to avoid Telegram FloodWait with real-time Unicode bar."""
     def __init__(self, message, action: str, filename: str, icon: str, total_size: int, update_interval: float = 1.5):
         self.message = message
         self.action = action
@@ -123,7 +123,8 @@ class ProgressTracker:
         if not total or total <= 0:
             total = self.total_size
 
-        if (now - self.last_update_time >= self.update_interval) or (current >= total and current > 0):
+        # Update if interval elapsed, or on first call (0%), or on completion (100%)
+        if (self.last_update_time == 0) or (now - self.last_update_time >= self.update_interval) or (current >= total and current > 0):
             self.last_update_time = now
             card_text = build_progress_card(
                 action=self.action,

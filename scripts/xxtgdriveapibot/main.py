@@ -2,6 +2,7 @@ import logging
 import asyncio
 import os
 import time
+import json
 from telethon import TelegramClient, events, Button
 from telethon.tl.types import Document, MessageMediaDocument, MessageMediaPhoto
 
@@ -334,6 +335,7 @@ async def media_upload_handler(event):
             total_size=file_size,
             update_interval=1.5
         )
+        await up_tracker.callback(0, file_size)
 
         folder_id, folder_name = get_user_folder(user_id)
         folder_tag = f"📁 {clean_html(folder_name)} 🎯" if folder_id != "root" else "Root (Saved Messages)"
@@ -346,6 +348,35 @@ async def media_upload_handler(event):
             mime_type=mime_type,
             progress_cb=up_tracker.callback
         )
+
+        # If Cloudflare/Worker API fails (e.g. 524 Timeout or Assembly Error), use Direct MTProto Engine
+        if upload_res.get("status") != "success":
+            logger.warning(f"API upload failed ({upload_res.get('message')}). Activating Direct MTProto Engine Fallback...")
+            try:
+                meta_json = json.dumps({"customName": file_name, "parentId": folder_id})
+                tg_caption = f"#TG_DRIVE_FILE#{meta_json}"
+                
+                # Direct MTProto upload (Zero Cloudflare timeout, 2GB+ support)
+                sent_msg = await client.send_file(
+                    event.chat_id,
+                    file=temp_path,
+                    caption=tg_caption,
+                    progress_callback=up_tracker.callback
+                )
+                file_id = str(sent_msg.id)
+                upload_res = {
+                    "status": "success",
+                    "data": {
+                        "id": file_id,
+                        "message_id": file_id,
+                        "name": file_name,
+                        "size": file_size,
+                        "destination": "Telegram MTProto Cloud ('Saved Messages')",
+                        "download_url": build_download_url(file_id, api_key)
+                    }
+                }
+            except Exception as mt_err:
+                logger.error(f"Direct MTProto fallback error: {mt_err}")
 
         if upload_res.get("status") == "success":
             # Invalidate cache so new file shows up instantly
@@ -1325,21 +1356,102 @@ async def callback_handler(event):
         await event.edit(text, buttons=back_to_main_kb(), parse_mode="html")
         return
 
-# ----------------- MAIN RUNNER ----------------- #
+# ----------------- FORCE CLEANING ENGINE ----------------- #
+
+def force_purge_temp_storage(max_age_seconds: int = 0) -> int:
+    """
+    Forcefully purges temporary upload files from VPS disk.
+    If max_age_seconds == 0: Purges all files immediately (Startup/Shutdown/Crash recovery).
+    If max_age_seconds > 0: Purges files older than max_age_seconds (Stuck/abandoned downloads).
+    """
+    cleaned = 0
+    try:
+        temp_dir = str(TEMP_DIR)
+        if not os.path.exists(temp_dir):
+            os.makedirs(temp_dir, exist_ok=True)
+            return 0
+
+        now = time.time()
+        for fname in os.listdir(temp_dir):
+            fpath = os.path.join(temp_dir, fname)
+            if os.path.isfile(fpath) or os.path.islink(fpath):
+                try:
+                    if max_age_seconds <= 0:
+                        os.remove(fpath)
+                        cleaned += 1
+                    else:
+                        mtime = os.path.getmtime(fpath)
+                        if (now - mtime) > max_age_seconds:
+                            os.remove(fpath)
+                            cleaned += 1
+                except Exception as ex:
+                    logger.debug(f"Could not remove {fpath}: {ex}")
+            elif os.path.isdir(fpath) and max_age_seconds <= 0:
+                try:
+                    import shutil
+                    shutil.rmtree(fpath, ignore_errors=True)
+                    cleaned += 1
+                except Exception:
+                    pass
+
+        if cleaned > 0:
+            logger.info(f"🧹 Force Cleaner: Purged {cleaned} temporary/stuck file(s) from VPS disk.")
+    except Exception as e:
+        logger.warning(f"Force purge error: {e}")
+    return cleaned
+
+async def periodic_temp_cleaner_task():
+    """Background task that runs every 10 minutes to auto-purge any stuck/orphaned download files."""
+    while True:
+        try:
+            await asyncio.sleep(600)  # Check every 10 minutes
+            force_purge_temp_storage(max_age_seconds=900)  # Purge files stuck > 15 mins
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"Periodic cleaner task exception: {e}")
+            await asyncio.sleep(60)
+
+def register_cleanup_hooks():
+    """Register system shutdown and signal hooks to ensure zero disk leaks."""
+    import atexit
+    import signal
+
+    atexit.register(lambda: force_purge_temp_storage(0))
+
+    def _signal_handler(signum, frame):
+        logger.info(f"Received termination signal ({signum}). Running emergency force purge...")
+        force_purge_temp_storage(0)
+        os._exit(0)
+
+    try:
+        signal.signal(signal.SIGINT, _signal_handler)
+        signal.signal(signal.SIGTERM, _signal_handler)
+    except Exception:
+        pass
 
 def main():
     init_db()
+    # 1. Immediate startup purge of any interrupted/broken files from previous crashes
+    force_purge_temp_storage(0)
+    register_cleanup_hooks()
+
     print("========================================")
     print("🚀 TG Drive MTProto Bot is Starting...")
     print(f"🤖 Bot Token: {BOT_TOKEN[:10]}...")
     print("⚡ 2GB+ File Upload Engine: ACTIVE (Telethon MTProto)")
     print("📊 Real-Time Visual Loading Progress: ACTIVE")
     print("⚡ Ultra-Fast Memory Cache: ACTIVE")
+    print("🧹 Force Storage Cleaner & Crash Purge: ACTIVE")
     print("🔒 Session: Permanent (tgdrive_permanent_bot.session)")
     print("========================================")
     
     client.start(bot_token=BOT_TOKEN)
     logger.info("Bot is running and listening for events...")
+
+    # Start periodic background cleaner
+    client.loop.create_task(periodic_temp_cleaner_task())
+
     client.run_until_disconnected()
 
 if __name__ == "__main__":
