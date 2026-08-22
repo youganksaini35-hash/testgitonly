@@ -392,65 +392,82 @@ async def media_upload_handler(event):
     folder_id, folder_name = get_user_folder(user_id)
     folder_tag = f"📁 {clean_html(folder_name)} 🎯" if folder_id != "root" else "Root (Saved Messages)"
 
-    status_msg = await event.respond(
-        f"⚡ <b>Instant Storing in TG Drive...</b>\n\n"
-        f"{icon} <code>{clean_html(file_name)}</code> ({format_bytes(file_size)})\n"
-        f"📂 Target: {folder_tag}\n\n"
-        f"<code>[███████████████ 100%]</code> 🚀 <i>Direct MTProto Linking (0.3s)...</i>",
-        parse_mode="html"
-    )
+    initial_card = build_progress_card("⏳ Downloading", file_name, 0, file_size, time.time(), icon=icon)
+    status_msg = await event.respond(initial_card, parse_mode="html")
 
     temp_path = None
     try:
-        meta_json = json.dumps({"customName": file_name, "parentId": folder_id})
-        tg_caption = f"#TG_DRIVE_FILE#{meta_json}"
+        temp_dir = str(TEMP_DIR)
+        os.makedirs(temp_dir, exist_ok=True)
+        temp_path = os.path.join(temp_dir, f"up_{user_id}_{event.id}_{file_name}")
 
-        # 🚀 ZERO-DOWNLOAD DIRECT MTPROTO COPY (Instant 0.3s - 0 MB VPS Data & Disk Used!)
-        try:
-            sent_msg = await client.send_file(
-                event.chat_id,
-                file=event.message.media,
-                caption=tg_caption
-            )
-        except Exception as forward_err:
-            logger.warning(f"Direct media copy fallback to stream: {forward_err}")
-            # Fallback if direct media handle fails
-            temp_dir = str(TEMP_DIR)
-            os.makedirs(temp_dir, exist_ok=True)
-            temp_path = os.path.join(temp_dir, f"up_{user_id}_{event.id}_{file_name}")
-            await client.download_media(event.message, file=temp_path)
-            sent_msg = await client.send_file(event.chat_id, file=temp_path, caption=tg_caption)
-
-        file_id = str(sent_msg.id)
-
-        # Invalidate cache so new file shows up instantly
-        file_cache.invalidate(user_id)
-        if folder_id != "root":
-            set_file_folder(user_id, file_id, folder_id)
-
-        dl_url = build_download_url(file_id, api_key)
-        dest = "Telegram Cloud ('Saved Messages')"
-
-        text = (
-            f"🎉 <b>FILE STORED INSTANTLY IN TG DRIVE!</b>\n\n"
-            f"{icon} <b>Name:</b> <code>{clean_html(file_name)}</code>\n"
-            f"📦 <b>Size:</b> <code>{format_bytes(file_size)}</code>\n"
-            f"🆔 <b>File ID:</b> <code>#{file_id}</code>\n"
-            f"📂 <b>Target Folder:</b> {folder_tag}\n"
-            f"⚡ <b>Speed:</b> <code>Instant (0.3s) - Zero VPS Data</code>\n"
-            f"☁️ <b>Storage:</b> {clean_html(dest)}\n\n"
-            f"🔗 <b>Direct Link:</b>\n<code>{dl_url}</code>"
+        dl_tracker = ProgressTracker(
+            message=status_msg,
+            action="⏳ Downloading",
+            filename=file_name,
+            icon=icon,
+            total_size=file_size,
+            update_interval=1.5
         )
 
-        buttons = [
-            [Button.url("⬇️ Direct Fast Download Link", dl_url)],
-            [
-                Button.inline("⭐ Star File", f"file_star:{file_id}:{folder_id}:1".encode('utf-8')),
-                Button.inline("🗑️ Delete", f"file_del_confirm:{file_id}:{folder_id}:1".encode('utf-8'))
-            ],
-            [Button.inline("📁 View in Files", f"menu_files:{folder_id}:1".encode('utf-8'))]
-        ]
-        await status_msg.edit(text, buttons=buttons, parse_mode="html")
+        await client.download_media(event.message, file=temp_path, progress_callback=dl_tracker.callback)
+
+        up_tracker = ProgressTracker(
+            message=status_msg,
+            action="🚀 Uploading to Saved Messages ('me')",
+            filename=file_name,
+            icon=icon,
+            total_size=file_size,
+            update_interval=1.5
+        )
+        await up_tracker.callback(0, file_size)
+
+        # 🚀 Upload directly to User's Saved Messages ('me') via TG Drive Cloud API
+        upload_res = await upload_file_streaming(
+            api_key=api_key,
+            file_path=temp_path,
+            filename=file_name,
+            folder_id=folder_id,
+            mime_type=mime_type,
+            progress_cb=up_tracker.callback
+        )
+
+        if upload_res.get("status") == "success":
+            # Invalidate cache so new file shows up instantly
+            file_cache.invalidate(user_id)
+
+            data = upload_res.get("data", {})
+            file_id = str(data.get("id") or data.get("message_id"))
+            if folder_id != "root":
+                set_file_folder(user_id, file_id, folder_id)
+
+            final_name = data.get("name", file_name)
+            final_size = data.get("size", file_size)
+            dl_url = build_download_url(file_id, api_key)
+            dest = data.get("destination", "Saved Messages ('me')")
+
+            text = (
+                f"🎉 <b>FILE STORED IN SAVED MESSAGES!</b>\n\n"
+                f"{icon} <b>Name:</b> <code>{clean_html(final_name)}</code>\n"
+                f"📦 <b>Size:</b> <code>{format_bytes(final_size)}</code>\n"
+                f"🆔 <b>File ID:</b> <code>#{file_id}</code>\n"
+                f"📂 <b>Target Folder:</b> {folder_tag}\n"
+                f"☁️ <b>Destination:</b> <code>{clean_html(dest)}</code>\n\n"
+                f"🔗 <b>Direct Link:</b>\n<code>{dl_url}</code>"
+            )
+
+            buttons = [
+                [Button.url("⬇️ Direct Fast Download Link", dl_url)],
+                [
+                    Button.inline("⭐ Star File", f"file_star:{file_id}:{folder_id}:1".encode('utf-8')),
+                    Button.inline("🗑️ Delete", f"file_del_confirm:{file_id}:{folder_id}:1".encode('utf-8'))
+                ],
+                [Button.inline("📁 View in Files", f"menu_files:{folder_id}:1".encode('utf-8'))]
+            ]
+            await status_msg.edit(text, buttons=buttons, parse_mode="html")
+        else:
+            err_msg = upload_res.get("message", "Upload failed")
+            await status_msg.edit(f"❌ <b>Upload Failed!</b>\n\n<b>Reason:</b> {clean_html(err_msg)}", buttons=back_to_main_kb(), parse_mode="html")
 
     except Exception as e:
         logger.error(f"Media upload error: {e}")
