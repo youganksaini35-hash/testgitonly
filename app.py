@@ -1452,19 +1452,36 @@ def restore_all_env_vaults_on_boot():
             logger.error(f"Error unpacking vault on boot for {script_name}: {e}")
 
 def read_script_env(py_filename):
-    """Reads environment variables from local .env or encrypted vault if on new runner."""
-    clean = py_filename.replace("scripts/", "").lstrip("/")
+    """Reads environment variables from encrypted vault first (source of truth), then local .env."""
+    clean = py_filename.replace("scripts/", "").lstrip("/").replace("\\", "/")
     base_name = os.path.basename(clean)
     if base_name.endswith(".py"):
         base_name = base_name[:-3]
     dir_name = os.path.dirname(clean)
-    
     target_dir = os.path.join(SCRIPTS_DIR, dir_name) if dir_name else SCRIPTS_DIR
-    os.makedirs(target_dir, exist_ok=True)
     
+    # 1. First priority: check Encrypted Vault (Source of truth)
+    vault = load_env_vault()
+    stored_enc = vault.get(clean) or vault.get(f"{clean}.py") or vault.get(base_name) or vault.get(f"scripts/{clean}")
+    if stored_enc:
+        decrypted_json_str = decrypt_secret_data(stored_enc)
+        if decrypted_json_str:
+            try:
+                decrypted_dict = json.loads(decrypted_json_str)
+                if decrypted_dict:
+                    # Sync to local physical .env file so python scripts and python-dotenv read it directly
+                    os.makedirs(target_dir, exist_ok=True)
+                    dot_env = os.path.join(target_dir, ".env")
+                    with open(dot_env, "w", encoding="utf-8") as f:
+                        for k, v in sorted(decrypted_dict.items()):
+                            f.write(f"{k}={v}\n")
+                    return decrypted_dict
+            except Exception as e:
+                logger.error(f"Error parsing decrypted vault for {clean}: {e}")
+
+    # 2. Fallback: local .env files
     merged_env = {}
     candidates = get_all_env_candidates(py_filename)
-    
     for c in reversed(candidates):
         if os.path.exists(c):
             try:
@@ -1479,26 +1496,8 @@ def read_script_env(py_filename):
                             v = v.strip().strip("'\"")
                             if k:
                                 merged_env[k] = v
-            except Exception as e:
-                logger.error(f"Error reading env from {c}: {e}")
-                
-    # If empty, restore from encrypted vault
-    if not merged_env:
-        vault = load_env_vault()
-        stored_enc = vault.get(clean) or vault.get(base_name) or vault.get(f"{base_name}.py")
-        if stored_enc:
-            decrypted_json_str = decrypt_secret_data(stored_enc)
-            if decrypted_json_str:
-                try:
-                    decrypted_dict = json.loads(decrypted_json_str)
-                    merged_env.update(decrypted_dict)
-                    dot_env = os.path.join(target_dir, ".env")
-                    with open(dot_env, "w", encoding="utf-8") as f:
-                        for k, v in sorted(merged_env.items()):
-                            f.write(f"{k}={v}\n")
-                except Exception:
-                    pass
-                    
+            except Exception:
+                pass
     return merged_env
 
 def write_script_env(py_filename, env_dict):
