@@ -182,9 +182,23 @@ def edit_tg_message(chat_id, message_id, text, reply_markup=None, parse_mode="HT
             err_desc = resp.get("description", "")
             if "message is not modified" in err_desc:
                 return resp
-            # Fallback without parse_mode in case of HTML entity parsing issue
+            # Fallback 1: Plain text without HTML parsing
+            import re
+            plain_text = re.sub(r'<[^>]+>', '', text)
+            payload["text"] = plain_text
             payload.pop("parse_mode", None)
-            return requests.post(url, json=payload, timeout=10).json()
+            resp2 = requests.post(url, json=payload, timeout=10).json()
+            if resp2.get("ok"):
+                return resp2
+            # Fallback 2: Send as fresh new message if message cannot be edited
+            send_payload = {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML"
+            }
+            if reply_markup:
+                send_payload["reply_markup"] = reply_markup
+            return requests.post(f"{TG_BASE_URL}/sendMessage", json=send_payload, timeout=10).json()
         return resp
     except Exception as e:
         logger.error(f"Failed to edit message: {e}")
@@ -2506,15 +2520,18 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
     # 10c. Delete Single File/Folder Prompt (Confirmation)
     elif data.startswith("file_del_") and not data.startswith("file_del_all"):
         fname = data.replace("file_del_", "")
-        answer_callback(callback_id)
+        answer_callback(callback_id, f"Preparing deletion for {fname}...")
+        import html
+        esc_fname = html.escape(fname)
         text = (
-            f"⚠️ <b>Confirm Deletion</b>\n"
+            f"⚠️ <b>Confirm Permanent Deletion</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Are you sure you want to permanently delete <code>scripts/{fname}</code>?"
+            f"Are you sure you want to permanently delete <code>scripts/{esc_fname}</code>?\n\n"
+            "🔴 <i>Any active process, venv, and environment variables will be completely wiped.</i>"
         )
         markup = {
             "inline_keyboard": [
-                [{"text": f"🗑️ Yes, Delete {fname}", "callback_data": f"do_delete_file_{fname}"}],
+                [{"text": f"🗑️ Yes, Delete {fname[:25]}", "callback_data": f"do_delete_file_{fname}"}],
                 [{"text": "❌ Cancel", "callback_data": "menu_files"}]
             ]
         }
