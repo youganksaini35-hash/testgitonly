@@ -233,46 +233,57 @@ def download_tg_file(file_id, destination_path):
 # ---------------------------------------------------------------------------
 # GitHub Git Auto-Sync
 # ---------------------------------------------------------------------------
+git_sync_lock = threading.Lock()
+
 def git_sync_to_github(commit_message="Update via Telegram Controller"):
     if not GH_PAT or not REPO:
         return False, "GitHub Token or Repo not set"
     
-    try:
-        remote_url = f"https://{GH_PAT}@github.com/{REPO}.git"
-        subprocess.run(["git", "config", "user.name", "TelegramController"], check=True)
-        subprocess.run(["git", "config", "user.email", "bot@controller.local"], check=True)
-        
-        # 1. Stage all changes including deletions (-A)
-        subprocess.run(["git", "add", "-A"], check=True)
-        
-        # 2. Secret & Archive Shield: unstage any accidental archives or plain .env files
-        subprocess.run(["git", "rm", "-r", "--cached", "*.zip", "*.tar", "*.gz", "*.env", ".staging_*"], capture_output=True)
-        subprocess.run(["git", "reset", "*.zip", "*.tar", "*.gz", "*.env", ".staging_*"], capture_output=True)
-        
-        # 3. Commit local state (including deletions) BEFORE pulling/rebasing
-        status = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
-        if status.stdout.strip():
-            subprocess.run(["git", "commit", "-m", commit_message], check=True)
-        
-        # 4. Pull remote changes with autostash rebase to prevent restoring deleted files
-        subprocess.run(["git", "pull", "--rebase", "--autostash", remote_url, "main"], capture_output=True)
-        
-        # 5. Push changes
-        push_res = subprocess.run(["git", "push", remote_url, "main"], capture_output=True, text=True)
-        if push_res.returncode == 0:
-            logger.info("Auto-sync to cloud complete.")
-            return True, "Cloud sync complete! All changes backed up."
-        else:
-            # If rejected, try rebase once and push again
+    with git_sync_lock:
+        try:
+            # Clean up stale index.lock if leftover from any interrupted git command
+            index_lock = os.path.join(WORKSPACE_DIR, ".git", "index.lock")
+            if os.path.exists(index_lock):
+                try:
+                    os.remove(index_lock)
+                except Exception:
+                    pass
+
+            remote_url = f"https://{GH_PAT}@github.com/{REPO}.git"
+            subprocess.run(["git", "config", "user.name", "TelegramController"], check=True)
+            subprocess.run(["git", "config", "user.email", "bot@controller.local"], check=True)
+            
+            # 1. Stage all changes including deletions (-A)
+            subprocess.run(["git", "add", "-A"], check=True)
+            
+            # 2. Secret & Archive Shield: unstage any accidental archives or plain .env files
+            subprocess.run(["git", "rm", "-r", "--cached", "*.zip", "*.tar", "*.gz", "*.env", ".staging_*"], capture_output=True)
+            subprocess.run(["git", "reset", "*.zip", "*.tar", "*.gz", "*.env", ".staging_*"], capture_output=True)
+            
+            # 3. Commit local state (including deletions) BEFORE pulling/rebasing
+            status = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
+            if status.stdout.strip():
+                subprocess.run(["git", "commit", "-m", commit_message], check=True)
+            
+            # 4. Pull remote changes with autostash rebase to prevent restoring deleted files
             subprocess.run(["git", "pull", "--rebase", "--autostash", remote_url, "main"], capture_output=True)
+            
+            # 5. Push changes
             push_res = subprocess.run(["git", "push", remote_url, "main"], capture_output=True, text=True)
             if push_res.returncode == 0:
-                logger.info("Auto-sync to cloud complete after rebase.")
+                logger.info("Auto-sync to cloud complete.")
                 return True, "Cloud sync complete! All changes backed up."
-            logger.error(f"Git push error: {push_res.stderr}")
-            return False, f"Cloud Sync error: {push_res.stderr[-200:]}"
-    except Exception as e:
-        return False, str(e)
+            else:
+                # If rejected, try rebase once and push again
+                subprocess.run(["git", "pull", "--rebase", "--autostash", remote_url, "main"], capture_output=True)
+                push_res = subprocess.run(["git", "push", remote_url, "main"], capture_output=True, text=True)
+                if push_res.returncode == 0:
+                    logger.info("Auto-sync to cloud complete after rebase.")
+                    return True, "Cloud sync complete! All changes backed up."
+                logger.error(f"Git push error: {push_res.stderr}")
+                return False, f"Cloud Sync error: {push_res.stderr[-200:]}"
+        except Exception as e:
+            return False, str(e)
 
 # ---------------------------------------------------------------------------
 # Process Manager (Run, Stop, Restart Scripts)
@@ -2516,17 +2527,22 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
         if not os.path.exists(target_path):
             target_path = os.path.join(WORKSPACE_DIR, fname)
 
-        # 1. Stop if this script or any script inside this folder is running
-        stop_child_app(script_name=fname, clear_active=True)
+        # 1. Stop matching process (without triggering duplicate git sync)
+        stop_child_app(script_name=fname, clear_active=False)
 
-        # 2. Clean up from encrypted vault and config in real time
+        # 2. Update config active_scripts
+        active_list = list(get_active_running_processes().keys())
+        config["active_scripts"] = active_list
+
+        # 3. Clean up from encrypted vault and config in real time
         vault = load_env_vault()
-        keys_to_del = [k for k in list(vault.keys()) if k == fname or k.startswith(f"{fname}/") or os.path.basename(k) == fname]
+        keys_to_del = [k for k in list(vault.keys()) if k == fname or k.startswith(f"{fname}/") or os.path.basename(k) == fname or os.path.dirname(k) == fname]
         for k in keys_to_del:
             vault.pop(k, None)
         save_env_vault(vault)
+        save_config(config)
 
-        # 3. Clean up isolated virtualenv
+        # 4. Clean up isolated virtualenv
         venv_slug = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', fname)
         v_dir = os.path.join(VENVS_DIR, venv_slug)
         if os.path.exists(v_dir):
@@ -2536,6 +2552,8 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
             except Exception:
                 pass
 
+        # 5. Delete target file or folder from disk
+        deleted_successfully = False
         if os.path.exists(target_path):
             import shutil
             try:
@@ -2543,26 +2561,26 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
                     shutil.rmtree(target_path, ignore_errors=True)
                 else:
                     os.remove(target_path)
+                deleted_successfully = True
             except Exception as e_del:
                 logger.error(f"Error removing {target_path}: {e_del}")
 
-            # Also delete companion files like .env or .requirements.txt
-            base_n = fname.rsplit('.', 1)[0]
-            for extra in [f"{base_n}.requirements.txt", f"{base_n}.env", f"{fname}.env"]:
-                extra_p = os.path.join(SCRIPTS_DIR, extra)
-                if os.path.exists(extra_p):
-                    try:
-                        os.remove(extra_p)
-                    except Exception:
-                        pass
+        # Also delete companion files like .env or .requirements.txt
+        base_n = fname.rsplit('.', 1)[0]
+        for extra in [f"{base_n}.requirements.txt", f"{base_n}.env", f"{fname}.env", f"{fname}.requirements.txt"]:
+            extra_p = os.path.join(SCRIPTS_DIR, extra)
+            if os.path.exists(extra_p):
+                try:
+                    os.remove(extra_p)
+                    deleted_successfully = True
+                except Exception:
+                    pass
 
-            # Sync to GitHub in background so it never hangs or slows Telegram
-            threading.Thread(target=git_sync_to_github, args=(f"Deleted scripts/{fname} via Telegram",), daemon=True).start()
-            answer_callback(callback_id, f"{fname} deleted successfully!", show_alert=True)
-            show_files_view(chat_id, message_id)
-        else:
-            answer_callback(callback_id, "File not found!", show_alert=True)
-            show_files_view(chat_id, message_id)
+        # 6. Single atomic background cloud sync
+        threading.Thread(target=git_sync_to_github, args=(f"Deleted scripts/{fname} via Telegram",), daemon=True).start()
+        
+        answer_callback(callback_id, f"🗑️ {fname} deleted successfully!", show_alert=True)
+        show_files_view(chat_id, message_id)
 
     # 11. Pip prompt
     elif data == "menu_pip_prompt":
