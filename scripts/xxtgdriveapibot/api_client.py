@@ -140,34 +140,25 @@ async def upload_file_streaming_direct(api_key: str, file_path: str, filename: s
     headers = _get_headers(api_key)
     total_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
 
-    async def file_stream_generator():
-        sent = 0
-        chunk_size = 512 * 1024  # 512 KB
-        with open(file_path, 'rb') as f:
-            while True:
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    break
-                sent += len(chunk)
-                if progress_cb:
-                    try:
-                        await progress_cb(sent, total_size)
-                    except Exception:
-                        pass
-                yield chunk
-
-    form = aiohttp.FormData()
-    form.add_field('folder_id', folder_id)
-    form.add_field('file', file_stream_generator(), filename=filename, content_type=mime_type)
-
     timeout = aiohttp.ClientTimeout(total=900)  # 15 minutes max
     async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
-        async with session.post(url, data=form) as resp:
-            try:
-                return await resp.json()
-            except Exception:
-                text = await resp.text()
-                return {"status": "error", "message": f"Server response: {text[:200]}"}
+        with open(file_path, 'rb') as f:
+            form = aiohttp.FormData()
+            form.add_field('folder_id', str(folder_id))
+            form.add_field('file', f, filename=filename, content_type=mime_type)
+
+            async with session.post(url, data=form) as resp:
+                try:
+                    res_json = await resp.json()
+                    if progress_cb and total_size > 0:
+                        try:
+                            await progress_cb(total_size, total_size)
+                        except Exception:
+                            pass
+                    return res_json
+                except Exception:
+                    text = await resp.text()
+                    return {"status": "error", "message": f"Server response: {text[:200]}"}
 
 async def upload_file_chunked(
     api_key: str,
