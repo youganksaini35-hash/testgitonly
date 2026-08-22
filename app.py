@@ -244,7 +244,11 @@ def git_sync_to_github(commit_message="Update via Telegram Controller"):
         
         # Pull any remote changes with rebase first
         subprocess.run(["git", "pull", "--rebase", remote_url, "main"], capture_output=True)
+        
+        # Secret & Archive Shield: strictly unstage / remove any accidental archives or plain .env files
+        subprocess.run(["git", "rm", "-r", "--cached", "*.zip", "*.tar", "*.gz", "*.env", ".staging_*"], capture_output=True)
         subprocess.run(["git", "add", "."], check=True)
+        subprocess.run(["git", "reset", "*.zip", "*.tar", "*.gz", "*.env", ".staging_*"], capture_output=True)
         
         status = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
         if not status.stdout.strip():
@@ -2627,8 +2631,11 @@ def handle_document_upload(chat_id, user_id, doc):
             return
 
     # Normal Download for non-conflicting files
+    is_zip = file_name.endswith(".zip")
+    download_dest = os.path.join(WORKSPACE_DIR, f".staging_{user_id}_{int(time.time())}_{file_name}") if is_zip else scripts_path
+    
     send_tg_message(chat_id, f"📥 <b>Receiving {file_name}...</b>")
-    ok, err = download_tg_file(file_id, scripts_path)
+    ok, err = download_tg_file(file_id, download_dest)
     
     if not ok:
         send_tg_message(chat_id, f"❌ Download failed: {err}")
@@ -2638,17 +2645,18 @@ def handle_document_upload(chat_id, user_id, doc):
     if file_name == "requirements.txt":
         import shutil
         try:
-            shutil.copy(scripts_path, root_path)
+            shutil.copy(download_dest, root_path)
         except Exception:
             pass
     
-    # Auto-commit to GitHub scripts/ folder
-    git_sync_to_github(f"Upload {file_name} into scripts/ folder")
+    # Auto-commit single standalone files (non-archives) to GitHub scripts/ folder
+    if not is_zip:
+        git_sync_to_github(f"Upload {file_name} into scripts/ folder")
     
     current_state = user_states.get(user_id)
     
     # 0b. If uploaded a .zip project archive
-    if file_name.endswith(".zip"):
+    if is_zip:
         import zipfile
         zip_base = file_name[:-4]
         
@@ -2665,7 +2673,7 @@ def handle_document_upload(chat_id, user_id, doc):
         extracted_project_dir = None
         
         try:
-            with zipfile.ZipFile(scripts_path, 'r') as zip_ref:
+            with zipfile.ZipFile(download_dest, 'r') as zip_ref:
                 namelist = zip_ref.namelist()
                 top_dirs = {item.split('/')[0] for item in namelist if item and not item.startswith('/')}
                 
@@ -2684,11 +2692,15 @@ def handle_document_upload(chat_id, user_id, doc):
                     extracted_project_dir = target_extract_dir
             
             try:
-                os.remove(scripts_path)
+                os.remove(download_dest)
             except Exception:
                 pass
                 
         except Exception as e:
+            try:
+                os.remove(download_dest)
+            except Exception:
+                pass
             send_tg_message(chat_id, f"❌ Failed to extract zip: {e}")
             return
 
@@ -2716,7 +2728,7 @@ def handle_document_upload(chat_id, user_id, doc):
                 with open(req, "r", encoding="utf-8", errors="ignore") as rf:
                     req_installed_count += len([l for l in rf if l.strip() and not l.startswith("#")])
 
-        # Auto-Load & Bind .env Variables
+        # Auto-Load & Bind .env Variables into AES-256 Encrypted Vault and purge plain files
         env_loaded_count = 0
         if found_envs and entry_script:
             for ef in found_envs:
@@ -2726,14 +2738,23 @@ def handle_document_upload(chat_id, user_id, doc):
                         l = l.strip()
                         if "=" in l and not l.startswith("#"):
                             k, v = l.split("=", 1)
-                            parsed[k.strip().upper()] = v.strip().strip("'\"")
+                            clean_k = k.strip()
+                            clean_v = v.strip().strip("'\"")
+                            if clean_k and clean_v:
+                                parsed[clean_k] = clean_v
                 if parsed:
                     curr_env = read_script_env(entry_script)
                     curr_env.update(parsed)
                     write_script_env(entry_script, curr_env)
                     env_loaded_count += len(parsed)
+                # Purge raw plaintext .env from disk so git never commits it!
+                try:
+                    os.remove(ef)
+                except Exception:
+                    pass
 
-        git_sync_to_github(f"Deploy ZIP project: {file_name}")
+        # Sync project code safely to GitHub cloud
+        git_sync_to_github(f"Deploy ZIP project: {zip_base}")
 
         entry_display = entry_script or 'None'
         deploy_msg = (

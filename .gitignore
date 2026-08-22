@@ -11,3 +11,10 @@ __pycache__/
 venv/
 .staging_*
 temp_*
+*.zip
+*.tar
+*.gz
+*.rar
+*.7z
+*.tar.gz
+*.tgz
