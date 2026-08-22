@@ -242,26 +242,29 @@ def git_sync_to_github(commit_message="Update via Telegram Controller"):
         subprocess.run(["git", "config", "user.name", "TelegramController"], check=True)
         subprocess.run(["git", "config", "user.email", "bot@controller.local"], check=True)
         
-        # Pull any remote changes with rebase first
-        subprocess.run(["git", "pull", "--rebase", remote_url, "main"], capture_output=True)
+        # 1. Stage all changes including deletions (-A)
+        subprocess.run(["git", "add", "-A"], check=True)
         
-        # Secret & Archive Shield: strictly unstage / remove any accidental archives or plain .env files
+        # 2. Secret & Archive Shield: unstage any accidental archives or plain .env files
         subprocess.run(["git", "rm", "-r", "--cached", "*.zip", "*.tar", "*.gz", "*.env", ".staging_*"], capture_output=True)
-        subprocess.run(["git", "add", "."], check=True)
         subprocess.run(["git", "reset", "*.zip", "*.tar", "*.gz", "*.env", ".staging_*"], capture_output=True)
         
+        # 3. Commit local state (including deletions) BEFORE pulling/rebasing
         status = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
-        if not status.stdout.strip():
-            return True, "All files already up to date."
+        if status.stdout.strip():
+            subprocess.run(["git", "commit", "-m", commit_message], check=True)
         
-        subprocess.run(["git", "commit", "-m", commit_message], check=True)
+        # 4. Pull remote changes with autostash rebase to prevent restoring deleted files
+        subprocess.run(["git", "pull", "--rebase", "--autostash", remote_url, "main"], capture_output=True)
+        
+        # 5. Push changes
         push_res = subprocess.run(["git", "push", remote_url, "main"], capture_output=True, text=True)
         if push_res.returncode == 0:
             logger.info("Auto-sync to cloud complete.")
             return True, "Cloud sync complete! All changes backed up."
         else:
             # If rejected, try rebase once and push again
-            subprocess.run(["git", "pull", "--rebase", remote_url, "main"], capture_output=True)
+            subprocess.run(["git", "pull", "--rebase", "--autostash", remote_url, "main"], capture_output=True)
             push_res = subprocess.run(["git", "push", remote_url, "main"], capture_output=True, text=True)
             if push_res.returncode == 0:
                 logger.info("Auto-sync to cloud complete after rebase.")
@@ -2514,10 +2517,24 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
             target_path = os.path.join(WORKSPACE_DIR, fname)
 
         # 1. Stop if this script or any script inside this folder is running
-        active = get_active_running_processes()
-        for k in list(active.keys()):
-            if k == fname or k.startswith(f"{fname}/") or os.path.basename(k) == fname:
-                stop_child_app(script_name=k, clear_active=True)
+        stop_child_app(script_name=fname, clear_active=True)
+
+        # 2. Clean up from encrypted vault and config in real time
+        vault = load_env_vault()
+        keys_to_del = [k for k in list(vault.keys()) if k == fname or k.startswith(f"{fname}/") or os.path.basename(k) == fname]
+        for k in keys_to_del:
+            vault.pop(k, None)
+        save_env_vault(vault)
+
+        # 3. Clean up isolated virtualenv
+        venv_slug = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', fname)
+        v_dir = os.path.join(VENVS_DIR, venv_slug)
+        if os.path.exists(v_dir):
+            import shutil
+            try:
+                shutil.rmtree(v_dir, ignore_errors=True)
+            except Exception:
+                pass
 
         if os.path.exists(target_path):
             import shutil
@@ -2531,7 +2548,7 @@ def handle_callback_query(callback_id, chat_id, user_id, message_id, data):
 
             # Also delete companion files like .env or .requirements.txt
             base_n = fname.rsplit('.', 1)[0]
-            for extra in [f"{base_n}.requirements.txt", f"{base_n}.env"]:
+            for extra in [f"{base_n}.requirements.txt", f"{base_n}.env", f"{fname}.env"]:
                 extra_p = os.path.join(SCRIPTS_DIR, extra)
                 if os.path.exists(extra_p):
                     try:
